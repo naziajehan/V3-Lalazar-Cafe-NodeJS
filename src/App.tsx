@@ -6,44 +6,42 @@ import {
   type ReactNode,
 } from "react"
 import {
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signOut,
-  type User,
-} from "firebase/auth"
-import { FirebaseError } from "firebase/app"
+  MENU,
+  CATEGORIES,
+  WHATSAPP_NUMBER,
+  type MenuItem,
+  type CartItem,
+} from "./menu"
 import {
-  addDoc,
-  deleteDoc,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  limit,
-  onSnapshot,
-  orderBy,
-  query as firestoreQuery,
-  serverTimestamp,
-  setDoc,
-  Timestamp,
-  updateDoc,
-  writeBatch,
-} from "firebase/firestore"
-import { ADMIN_EMAIL, auth, db, messaging } from "./firebase"
-import { MENU, WHATSAPP_NUMBER, type MenuItem, type CartItem } from "./menu"
-import { getToken, onMessage } from "firebase/messaging"
+  ADMIN_EMAIL,
+  auth,
+  createOrder,
+  firebaseConfigured,
+  getAuthErrorMessage,
+  importLegacyData,
+  saveCafeSettings,
+  saveCustomers as persistCustomers,
+  saveMenuItems,
+  saveOrders as persistOrders,
+  signInAdmin,
+  signOutAdmin,
+  subscribeAdminData,
+  subscribeMenu,
+  subscribeSettings,
+  type CafeSettings,
+  type CustomerData,
+  type LegacyCafeData,
+  type OrderData,
+} from "./firebase"
+import { onAuthStateChanged, type User } from "firebase/auth"
 
-
-const GRILL_IMAGE =
-  MENU.find((item) => item.name === "Nawabi Pizza")?.image ?? "/images/meal.jpg"
-const FOOD_IMAGE =
-  MENU.find((item) => item.name === "Special Pizzratha")?.image ??
-  "/images/meal.jpg"
-const INTERIOR_IMAGE =
-  MENU.find((item) => item.name === "Oven Baked Wings")?.image ??
-  "/images/meal.jpg"
-const FALLBACK_IMAGE = "/images/meal.jpg"
+const GRILL_IMAGE = "/images/grill.jpg"
+const FOOD_IMAGE = "/images/meal.jpg"
+const INTERIOR_IMAGE = "/images/interior.jpg"
 const MONEY = (value: number) => `Rs. ${value.toLocaleString("en-PK")}`
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}
 type IconName = "arrow" | "bag" | "close" | "plus" | "minus" | "menu" | "leaf" | "flame" | "heart" | "check" | "grid" | "utensils" | "settings" | "logout" | "lock" | "search" | "edit" | "message"
 
 interface IconProps {
@@ -166,24 +164,17 @@ function Flower({ className = "" }: { className?: string }) {
   )
 }
 
-function Brand({
-  light = false,
-  name = "Al Maida Pizza Garden",
-}: {
-  light?: boolean
-  name?: string
-}) {
-  const words = name.trim().toUpperCase().split(/\s+/)
+function Brand({ light = false }: { light?: boolean }) {
   return (
     <a
       href="#/"
       className={`brand ${light ? "brand-light" : ""}`}
-      aria-label={`${name} home`}
+      aria-label="Lalazar Cafe home"
     >
       <Flower />
       <span>
-        <strong>{words.slice(0, 2).join(" ")}</strong>
-        {words.length > 2 && <small>{words.slice(2).join(" ")}</small>}
+        <strong>LALAZAR</strong>
+        <small>C A F E &nbsp; & &nbsp; C U L T U R E</small>
       </span>
     </a>
   )
@@ -254,7 +245,7 @@ function Dialog({
       >
         <div className="dialog-heading">
           <div>
-            <span className="eyebrow">AL MAIDA PIZZA GARDEN</span>
+            <span className="eyebrow">LALAZAR CAFE</span>
             <h2>{title}</h2>
           </div>
           <button
@@ -271,240 +262,525 @@ function Dialog({
   )
 }
 
-interface ContactInfo {
-  name: string
-  phone: string
-  address: string
-  hours: string
-  heroTitle: string
-  heroDescription: string
+type OrderStatus =
+  | "Pending"
+  | "Confirmed"
+  | "Preparing"
+  | "Out for delivery"
+  | "Delivered"
+  | "Cancelled"
+
+type CustomerRecord = CustomerData
+type CustomerOrderRecord = OrderData
+type ContactInfo = CafeSettings
+type RevenuePeriod = "day" | "week" | "month"
+
+interface RevenueBucket {
+  key: string
+  label: string
+  amount: number
 }
+
+interface OrderTimelineEntry {
+  status: OrderStatus
+  time: string
+  note: string
+}
+
+const ORDER_STATUS_FLOW: OrderStatus[] = [
+  "Pending",
+  "Confirmed",
+  "Preparing",
+  "Out for delivery",
+  "Delivered",
+]
 
 const DEFAULT_CONTACT_INFO: ContactInfo = {
-  name: "Al Maida Pizza Garden",
-  phone: "0331 7131160 ",
-  address: "Railway Road, Block A, Dera Ghazi Khan, 02233",
-  hours: "Google currently lists closing at 2:00 AM",
-  heroTitle: "Pizzas, pizzratha, rolls and bites made to share.",
-  heroDescription:
-    "Explore Al Maida Pizza Garden's delivery menu: deep pan and square pan pizzas, pasta, rolls, fries, burgers, meals and deals.",
+  phone: WHATSAPP_NUMBER,
+  email: "hello@lalazar.cafe",
+  address: "Main Bazaar, Quetta, Pakistan",
+  hours: "11:00 AM - 11:00 PM",
 }
 
-function parseMenuItem(id: string, value: unknown): MenuItem | null {
-  if (
-    !isRecord(value) ||
-    !Number.isInteger(value.id) ||
-    typeof value.name !== "string" ||
-    typeof value.urdu !== "string" ||
-    typeof value.description !== "string" ||
-    !Number.isFinite(value.price) ||
-    typeof value.category !== "string" ||
-    typeof value.image !== "string"
-  ) {
-    return null
-  }
-  return {
-    id: Number(value.id),
-    name: value.name,
-    urdu: value.urdu,
-    description: value.description,
-    price: Number(value.price),
-    priceFrom: Boolean(value.priceFrom),
-    category: value.category,
-    image: value.image,
-    ...(typeof value.badge === "string" ? { badge: value.badge } : {}),
-    available: value.available !== false,
+function readLegacyValue(key: string): unknown {
+  const raw = localStorage.getItem(key)
+  if (raw === null) return undefined
+  try {
+    return JSON.parse(raw)
+  } catch {
+    throw new Error(`Saved browser data "${key}" is not valid JSON.`)
   }
 }
 
-function parseContactInfo(value: unknown): ContactInfo {
-  if (!isRecord(value)) return DEFAULT_CONTACT_INFO
-  return {
-    name:
-      typeof value.name === "string" && value.name.trim()
-        ? value.name
-        : DEFAULT_CONTACT_INFO.name,
-    phone:
-      typeof value.phone === "string"
-        ? value.phone
-        : DEFAULT_CONTACT_INFO.phone,
-    address:
-      typeof value.address === "string"
-        ? value.address
-        : DEFAULT_CONTACT_INFO.address,
-    hours:
-      typeof value.hours === "string"
-        ? value.hours
-        : DEFAULT_CONTACT_INFO.hours,
-    heroTitle:
-      typeof value.heroTitle === "string"
-        ? value.heroTitle
-        : DEFAULT_CONTACT_INFO.heroTitle,
-    heroDescription:
-      typeof value.heroDescription === "string"
-        ? value.heroDescription
-        : DEFAULT_CONTACT_INFO.heroDescription,
+function isLegacyMenuItem(value: unknown): value is MenuItem {
+  if (typeof value !== "object" || value === null) return false
+  const item = value as Record<string, unknown>
+  return (
+    typeof item.id === "number" &&
+    typeof item.name === "string" &&
+    typeof item.urdu === "string" &&
+    typeof item.description === "string" &&
+    typeof item.price === "number" &&
+    Number.isFinite(item.price) &&
+    item.price > 0 &&
+    typeof item.category === "string" &&
+    typeof item.image === "string"
+  )
+}
+
+function isLegacyCustomer(value: unknown): value is CustomerRecord {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  return (
+    typeof record.id === "string" &&
+    typeof record.name === "string" &&
+    typeof record.phone === "string" &&
+    typeof record.email === "string" &&
+    typeof record.address === "string" &&
+    typeof record.notes === "string" &&
+    typeof record.createdAt === "string" &&
+    (record.orderId === undefined || typeof record.orderId === "string")
+  )
+}
+
+function isLegacyOrderStatus(value: unknown): value is OrderStatus {
+  return (
+    value === "Pending" ||
+    value === "Confirmed" ||
+    value === "Preparing" ||
+    value === "Out for delivery" ||
+    value === "Delivered" ||
+    value === "Cancelled"
+  )
+}
+
+function isLegacyOrder(value: unknown): value is CustomerOrderRecord {
+  if (typeof value !== "object" || value === null) return false
+  const record = value as Record<string, unknown>
+  const validItems =
+    Array.isArray(record.items) &&
+    record.items.every(
+      (item) =>
+        typeof item === "object" &&
+        item !== null &&
+        typeof item.id === "number" &&
+        typeof item.name === "string" &&
+        typeof item.qty === "number" &&
+        Number.isInteger(item.qty) &&
+        item.qty > 0 &&
+        typeof item.price === "number" &&
+        Number.isFinite(item.price),
+    )
+  const validTimeline =
+    Array.isArray(record.timeline) &&
+    record.timeline.every(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        isLegacyOrderStatus(entry.status) &&
+        typeof entry.time === "string" &&
+        typeof entry.note === "string",
+    )
+  return (
+    typeof record.id === "string" &&
+    typeof record.customerId === "string" &&
+    typeof record.customerName === "string" &&
+    typeof record.customerPhone === "string" &&
+    typeof record.customerAddress === "string" &&
+    validItems &&
+    typeof record.subtotal === "number" &&
+    isLegacyOrderStatus(record.status) &&
+    typeof record.createdAt === "string" &&
+    typeof record.updatedAt === "string" &&
+    typeof record.deadlineMinutes === "number" &&
+    typeof record.notes === "string" &&
+    validTimeline
+  )
+}
+
+function readLegacyData(): LegacyCafeData {
+  const data: LegacyCafeData = {}
+  const menu = readLegacyValue("lalazar.menu.v1")
+  if (menu !== undefined) {
+    if (!Array.isArray(menu)) {
+      throw new Error("Saved browser menu data is not a list.")
+    }
+    if (menu.length === 0) {
+      data.menu = MENU
+    } else {
+      if (!menu.every(isLegacyMenuItem)) {
+        throw new Error("Some saved browser menu items are invalid.")
+      }
+      data.menu = menu
+    }
   }
+
+  const customers = readLegacyValue("lalazar.customers.v1")
+  if (customers !== undefined) {
+    if (!Array.isArray(customers) || !customers.every(isLegacyCustomer)) {
+      throw new Error("Some saved browser customer records are invalid.")
+    }
+    if (customers.length > 0) data.customers = customers
+  }
+
+  const orders = readLegacyValue("lalazar.orders.v1")
+  if (orders !== undefined) {
+    if (!Array.isArray(orders) || !orders.every(isLegacyOrder)) {
+      throw new Error("Some saved browser orders are invalid.")
+    }
+    if (orders.length > 0) data.orders = orders
+  }
+
+  const savedContact = readLegacyValue("lalazar.contact.v1")
+  const savedWhatsapp = readLegacyValue("lalazar.whatsapp.v1")
+  if (savedContact !== undefined || savedWhatsapp !== undefined) {
+    const contactRecord =
+      typeof savedContact === "object" && savedContact !== null
+        ? (savedContact as Record<string, unknown>)
+        : {}
+    const validContact =
+      typeof contactRecord.email === "string" &&
+      typeof contactRecord.address === "string"
+        ? {
+            email: contactRecord.email,
+            address: contactRecord.address,
+            phone: typeof contactRecord.phone === "string"
+              ? contactRecord.phone
+              : DEFAULT_CONTACT_INFO.phone,
+            hours: typeof contactRecord.hours === "string"
+              ? contactRecord.hours
+              : DEFAULT_CONTACT_INFO.hours,
+          }
+        : {}
+    const phone =
+      typeof savedWhatsapp === "string" &&
+      /^\d{10,15}$/.test(savedWhatsapp.replace(/\D/g, ""))
+        ? savedWhatsapp.replace(/\D/g, "")
+        : typeof validContact.phone === "string"
+          ? validContact.phone
+          : DEFAULT_CONTACT_INFO.phone
+    data.settings = {
+      ...DEFAULT_CONTACT_INFO,
+      ...validContact,
+      phone,
+    }
+  }
+  return data
+}
+
+function clearImportedLegacyData(imported: {
+  menu: number
+  customers: number
+  orders: number
+  settings: boolean
+}) {
+  if (imported.menu) localStorage.removeItem("lalazar.menu.v1")
+  if (imported.customers) localStorage.removeItem("lalazar.customers.v1")
+  if (imported.orders) localStorage.removeItem("lalazar.orders.v1")
+  if (imported.settings) {
+    localStorage.removeItem("lalazar.contact.v1")
+    localStorage.removeItem("lalazar.whatsapp.v1")
+  }
+}
+
+function createTimeline(
+  createdAt: string,
+  status: OrderStatus = "Pending",
+): OrderTimelineEntry[] {
+  const base = new Date(createdAt).getTime()
+  const start = base
+  const offsets = [0, 8, 18, 30, 48]
+  return ORDER_STATUS_FLOW.map((step, index) => {
+    const stepTime = new Date(start + offsets[index] * 60 * 1000)
+    return {
+      status: step,
+      time: stepTime.toISOString(),
+      note:
+        step === status
+          ? `Marked as ${status}`
+          : step === "Pending"
+            ? "Order placed"
+            : step === "Confirmed"
+              ? "Restaurant confirmed request"
+              : step === "Preparing"
+                ? "Kitchen is busy cooking"
+                : step === "Out for delivery"
+                  ? "Order is on the way"
+                  : "Delivered to the guest",
+    }
+  })
+}
+
+function getOrderDeadlineText(order: CustomerOrderRecord) {
+  const deadline = new Date(order.createdAt).getTime() + order.deadlineMinutes * 60 * 1000
+  const remaining = Math.max(0, deadline - Date.now())
+  const minutesLeft = Math.ceil(remaining / (60 * 1000))
+
+  if (minutesLeft <= 0) return "Delayed"
+  if (minutesLeft <= 15) return `${minutesLeft} min left`
+  return `Due in ${minutesLeft} min`
+}
+
+const REVENUE_STATUSES = new Set<OrderStatus>([
+  "Confirmed",
+  "Preparing",
+  "Out for delivery",
+  "Delivered",
+])
+
+function getLocalDateKey(date: Date, includeHour = false) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  const hour = String(date.getHours()).padStart(2, "0")
+  return `${year}-${month}-${day}${includeHour ? `-${hour}` : ""}`
+}
+
+function getRevenueBuckets(
+  orders: CustomerOrderRecord[],
+  period: RevenuePeriod,
+  now = new Date(),
+): RevenueBucket[] {
+  const start = new Date(now)
+  start.setHours(0, 0, 0, 0)
+  if (period === "week") {
+    start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
+  } else if (period === "month") {
+    start.setDate(1)
+  }
+
+  const count =
+    period === "day"
+      ? 24
+      : period === "week"
+        ? 7
+        : new Date(start.getFullYear(), start.getMonth() + 1, 0).getDate()
+  const buckets = Array.from({ length: count }, (_, index) => {
+    const date = new Date(start)
+    if (period === "day") {
+      date.setHours(index)
+    } else {
+      date.setDate(start.getDate() + index)
+    }
+    return {
+      key: getLocalDateKey(date, period === "day"),
+      label:
+        period === "day"
+          ? date.toLocaleTimeString("en", { hour: "numeric" })
+          : period === "week"
+            ? date.toLocaleDateString("en", { weekday: "short" })
+            : String(date.getDate()),
+      amount: 0,
+    }
+  })
+  const bucketByKey = new Map(buckets.map((bucket) => [bucket.key, bucket]))
+
+  for (const order of orders) {
+    if (!REVENUE_STATUSES.has(order.status)) continue
+    const createdAt = new Date(order.createdAt)
+    if (!Number.isFinite(createdAt.getTime())) continue
+    const key = getLocalDateKey(createdAt, period === "day")
+    const bucket = bucketByKey.get(key)
+    if (bucket && Number.isFinite(order.subtotal) && order.subtotal > 0) {
+      bucket.amount += order.subtotal
+    }
+  }
+
+  return buckets
+}
+
+function countUniqueCustomers(orders: CustomerOrderRecord[]) {
+  return new Set(
+    orders
+      .filter((order) => order.status !== "Cancelled")
+      .map((order) => order.customerPhone.replace(/\D/g, ""))
+      .filter(Boolean),
+  ).size
+}
+
+function countRepeatCustomers(orders: CustomerOrderRecord[]) {
+  const ordersByPhone = new Map<string, number>()
+  for (const order of orders) {
+    if (order.status === "Cancelled") continue
+    const phone = order.customerPhone.replace(/\D/g, "")
+    if (phone) ordersByPhone.set(phone, (ordersByPhone.get(phone) ?? 0) + 1)
+  }
+  return [...ordersByPhone.values()].filter((count) => count > 1).length
 }
 
 export default function App() {
-  const whatsapp = WHATSAPP_NUMBER
   const [menu, setMenu] = useState<MenuItem[]>(MENU)
-  const [menuInitialized, setMenuInitialized] = useState(false)
-  const [menuCollectionEmpty, setMenuCollectionEmpty] = useState<boolean | null>(
-    null,
-  )
-  const [fcmToken, setFcmToken] = useState<string>("")
+  const [whatsapp, setWhatsapp] = useState(WHATSAPP_NUMBER)
+  const [customers, setCustomers] = useState<CustomerRecord[]>([])
+  const [orders, setOrders] = useState<CustomerOrderRecord[]>([])
   const [contactInfo, setContactInfo] =
     useState<ContactInfo>(DEFAULT_CONTACT_INFO)
-  // Task 1: Simple Push Notification Controller (1 text field + 1 button) for Al Maida. Action: write the text in the text field and click the button to push the notification to all other open tabs of the same browser. Use BroadcastChannel API for this task.
-  const [pushedMessage, setPushedMessage] = useState<string>("")
-  const [page, setPage] = useState<"home" | "menu" | "admin" | "login">(() =>
-    window.location.hash === "#/menu"
-      ? "menu"
-      : window.location.hash === "#/admin"
-        ? "admin"
-        : window.location.hash === "#/login"
-          ? "login"
-          : "home",
-  )
+  const [route, setRoute] = useState(window.location.hash)
   const [user, setUser] = useState<User | null>(null)
-  const [authReady, setAuthReady] = useState(false)
+  const [authReady, setAuthReady] = useState(!auth)
+  const authenticated =
+    user?.email?.toLowerCase() === ADMIN_EMAIL && user.emailVerified
   const [cart, setCart] = useState<CartItem[]>([])
   const [category, setCategory] = useState("All")
+  const [expanded, setExpanded] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [overlay, setOverlay] =
     useState<"cart" | "checkout" | "reservation" | null>(null)
   const [notice, setNotice] = useState("")
-  
-  // Task 1: Simple Push Notification Controller (1 text field + 1 button) for Al Maida. Action: write the text in the text field and click the button to push the notification to all other open tabs of the same browser. Use BroadcastChannel API for this task.
   useEffect(() => {
-  // Connect to the same broadcast channel name
-  const channel = new BroadcastChannel("al_maida_notifications")
-
-  channel.onmessage = (event) => {
-    if (event.data && event.data.text) {
-      setPushedMessage(event.data.text)
-    }
-  }
-
-  return () => channel.close()
+    if (!auth) return
+    return onAuthStateChanged(auth, (nextUser) => {
+      setUser(nextUser)
+      setAuthReady(true)
+    })
   }, [])
-  useEffect(
-    () =>
-      onAuthStateChanged(auth, (nextUser) => {
-        setUser(nextUser)
-        setAuthReady(true)
-      }),
-    [],
-  )
   useEffect(() => {
-    const unsubscribeMenu = onSnapshot(
-      firestoreQuery(collection(db, "menuItems"), orderBy("id")),
-      (snapshot) => {
-        if (snapshot.empty) {
-          setMenuCollectionEmpty(true)
-          return
-        }
-        setMenuCollectionEmpty(false)
-        const parsed = snapshot.docs
-          .map((menuDoc) => parseMenuItem(menuDoc.id, menuDoc.data()))
-          .filter((item): item is MenuItem => item !== null)
-        setMenu(parsed)
-      },
-      () => setNotice("Menu updates could not be loaded. Please refresh."),
-    )
-    const unsubscribeMenuMetadata = onSnapshot(
-      doc(db, "settings", "metadata"),
-      (snapshot) => {
-        setMenuInitialized(snapshot.data()?.menuInitialized === true)
-      },
-      () => setNotice("Menu initialization status could not be loaded."),
-    )
-    const unsubscribeSettings = onSnapshot(
-      doc(db, "settings", "restaurant"),
-      (snapshot) => {
-        if (snapshot.exists()) setContactInfo(parseContactInfo(snapshot.data()))
-      },
-      () =>
-        setNotice("Restaurant details could not be loaded. Please refresh."),
-    )
+    if (!firebaseConfigured) {
+      setNotice("Firebase is not configured. Add the Web app values to .env.local.")
+      return
+    }
+    const reportError = (error: Error) => {
+      setNotice(`Firebase error: ${error.message}`)
+    }
+    const unsubscribeMenu = subscribeMenu(setMenu, reportError)
+    const unsubscribeSettings = subscribeSettings((settings) => {
+      const next = { ...DEFAULT_CONTACT_INFO, ...settings }
+      setContactInfo(next)
+      if (/^\d{10,15}$/.test(next.phone.replace(/\D/g, ""))) {
+        setWhatsapp(next.phone.replace(/\D/g, ""))
+      }
+    }, reportError)
     return () => {
       unsubscribeMenu()
-      unsubscribeMenuMetadata()
       unsubscribeSettings()
     }
   }, [])
   useEffect(() => {
-    if (menuCollectionEmpty !== true) return
-    setMenu(menuInitialized ? [] : MENU)
-  }, [menuCollectionEmpty, menuInitialized])
-  useEffect(() => {
-    const updatePage = () => {
-      const nextPage =
-        window.location.hash === "#/menu"
-          ? "menu"
-          : window.location.hash === "#/admin"
-            ? "admin"
-            : window.location.hash === "#/login"
-              ? "login"
-              : "home"
-      setPage(nextPage)
-      setMobileNav(false)
-      if (nextPage === "menu") setCategory("All")
-      setOverlay(null)
-      window.scrollTo({ top: 0, behavior: "auto" })
+    if (!authenticated) {
+      setCustomers([])
+      setOrders([])
+      return
     }
-    window.addEventListener("hashchange", updatePage)
-    document.documentElement.lang = "en"
-    return () => window.removeEventListener("hashchange", updatePage)
+    return subscribeAdminData(setOrders, setCustomers, (error) => {
+      setNotice(`Could not load cafe records from Firebase: ${error.message}`)
+    })
+  }, [authenticated])
+  useEffect(() => {
+    if (!authenticated) return
+    let cancelled = false
+    const migrate = async () => {
+      const legacyData = readLegacyData()
+      if (Object.keys(legacyData).length === 0) return
+      const imported = await importLegacyData(legacyData)
+      if (cancelled) return
+      try {
+        clearImportedLegacyData(imported)
+      } catch (error) {
+        setNotice(
+          `Browser data was imported, but the old local copy could not be cleared: ${getErrorMessage(error)}`,
+        )
+        return
+      }
+      const count = imported.menu + imported.customers + imported.orders
+      if (count === 0 && !imported.settings) {
+        setNotice(
+          "Firebase already has data in these collections. Existing browser data was left untouched.",
+        )
+        return
+      }
+      setNotice(
+        `Imported ${imported.menu} menu items, ${imported.customers} customer records, ${imported.orders} orders${imported.settings ? " and cafe settings" : ""} from this browser to Firebase.`,
+      )
+    }
+    void migrate().catch((error: unknown) => {
+      setNotice(`Could not migrate browser data to Firebase: ${getErrorMessage(error)}`)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [authenticated])
+  useEffect(() => {
+    const update = () => {
+      setRoute(window.location.hash)
+      setMobileNav(false)
+      setOverlay(null)
+    }
+    window.addEventListener("hashchange", update)
+    return () => window.removeEventListener("hashchange", update)
   }, [])
   useEffect(() => {
-    if (
-      category !== "All" &&
-      !menu.some((item) => item.category === category)
-    ) {
-      setCategory("All")
-    }
-  }, [category, menu])
-  useEffect(() => {
     if (!authReady) return
-    if (page === "admin" && !user) {
-      window.location.hash = "#/login"
-    } else if (page === "login" && user) {
-      window.location.hash = "#/admin"
+    if (route === "#/admin" && !authenticated) {
+      window.location.hash = "/login"
+      return
     }
-  }, [authReady, page, user])
+    if (route === "#/login" && authenticated) {
+      window.location.hash = "/admin"
+      return
+    }
+  }, [route, authenticated, authReady])
   useEffect(() => {
-    document.title =
-      page === "menu"
-        ? `Full Menu | ${contactInfo.name}, Dera Ghazi Khan`
-        : page === "admin"
-          ? `Admin Workspace | ${contactInfo.name}`
-          : page === "login"
-            ? `Admin Sign In | ${contactInfo.name}`
-            : `${contactInfo.name} | Menu in Dera Ghazi Khan`
-  }, [page, contactInfo.name])
+    const adminPage = route === "#/admin" || route === "#/login"
+    document.title = adminPage
+      ? "Admin · Lalazar Cafe"
+      : "Lalazar Cafe · Balochi flavours, heartfelt hospitality"
+    document.documentElement.lang = "en"
+    if (route.startsWith("#/")) window.scrollTo({ top: 0, behavior: "instant" })
+  }, [route])
   useEffect(() => {
     if (!notice) return
     const id = setTimeout(() => setNotice(""), 4500)
     return () => clearTimeout(id)
   }, [notice])
-  useEffect(() => {
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker
-        .register("/firebase-messaging-sw.js")
-        .then((registration) => console.log("SW registered:", registration.scope))
-        .catch((err) => console.error("SW registration failed:", err))
+  const persistMenu = async (next: MenuItem[]) => {
+    try {
+      await saveMenuItems(menu, next)
+      setMenu(next)
+      setCart((current) =>
+        current.flatMap((item) => {
+          const updated = next.find((value) => value.id === item.id)
+          return updated && updated.available !== false
+            ? [{ ...updated, qty: item.qty }]
+            : []
+        }),
+      )
+      return true
+    } catch (error) {
+      setNotice(`Could not save the menu to Firebase: ${getErrorMessage(error)}`)
+      return false
     }
-
-    const unsubscribe = onMessage(messaging, (payload) => {
-      console.log("Foreground message received:", payload)
-      alert(`🍕 Al Maida Notification:\n${payload.notification?.title}\n${payload.notification?.body}`)
-    })
-
-    return () => unsubscribe()
-  }, [])
+  }
+  const saveCustomersToFirebase = async (next: CustomerRecord[]) => {
+    try {
+      await persistCustomers(customers, next)
+      setCustomers(next)
+      return true
+    } catch (error) {
+      setNotice(`Could not save customer records to Firebase: ${getErrorMessage(error)}`)
+      return false
+    }
+  }
+  const saveOrdersToFirebase = async (next: CustomerOrderRecord[]) => {
+    try {
+      await persistOrders(orders, next)
+      setOrders(next)
+      return true
+    } catch (error) {
+      setNotice(`Could not save orders to Firebase: ${getErrorMessage(error)}`)
+      return false
+    }
+  }
+  const saveContactInfoToFirebase = async (next: ContactInfo) => {
+    try {
+      await saveCafeSettings(next)
+      setContactInfo(next)
+      setWhatsapp(next.phone.replace(/\D/g, ""))
+      return true
+    } catch (error) {
+      setNotice(`Could not save cafe settings to Firebase: ${getErrorMessage(error)}`)
+      return false
+    }
+  }
   const changeQty = (item: MenuItem, delta: number) =>
     setCart((current) => {
       const found = current.find((value) => value.id === item.id)
@@ -519,142 +795,91 @@ export default function App() {
     })
   const count = cart.reduce((sum, item) => sum + item.qty, 0)
   const total = cart.reduce((sum, item) => sum + item.price * item.qty, 0)
+  const isAdmin = route === "#/admin" || route === "#/login"
   const close = useRef(() => setOverlay(null)).current
   const openWhatsApp = (message: string) => {
     window.open(
-      "https://wa.me/" + whatsapp + "?text=" + encodeURIComponent(message),
+      `https://wa.me/${whatsapp}?text=${encodeURIComponent(message)}`,
       "_blank",
       "noopener,noreferrer",
     )
   }
 
-  const requestNotificationPermission = async () => {
-    try {
-      const permission = await Notification.requestPermission()
-      if (permission === "granted") {
-        const currentToken = await getToken(messaging, {
-          vapidKey: "BJfXkJGgaTc7xI_YXJlicyVt_uB96MVccdBrDZX8YlEdq7SzAWA6_MwJtgFFYdcOzHEARY4cfkkJycg_ZiQyHwg" // Replace with your VAPID key from Firebase Console
-        })
-
-        if (currentToken) {
-          setFcmToken(currentToken)
-          console.log("FCM Token:", currentToken)
-
-          await setDoc(doc(db, "devices", currentToken), {
-            token: currentToken,
-            updatedAt: serverTimestamp(),
-          })
-
-          alert("Push notifications enabled successfully!")
-        } else {
-          console.log("No registration token available.")
-        }
-      } else {
-        alert("Notification permission was denied.")
-      }
-    } catch (error) {
-      console.error("Error retrieving FCM token:", error)
-    }
-  }
-
-  const featuredNames = [
-    "Nawabi Pizza",
-    "Special Pizzratha",
-    "Full Loaded Fries",
-    "Jalapeno Cheese Rolls",
-    "Oven Baked Wings",
-    "Brunch Meal",
-  ]
-  const featured = featuredNames
-    .map((name) => menu.find((item) => item.name === name))
-    .filter((item): item is MenuItem => item !== undefined)
-  const showHomeSection = (id: string) => {
-    setPage("home")
-    setMobileNav(false)
-    if (window.location.hash !== "#/") window.location.hash = "/"
-    window.setTimeout(
-      () => document.getElementById(id)?.scrollIntoView({ behavior: "smooth" }),
-      0,
+  if (isAdmin)
+    return (
+      <>
+        <Admin
+          menu={menu}
+          saveMenu={persistMenu}
+          customers={customers}
+          orders={orders}
+          contactInfo={contactInfo}
+          saveCustomers={saveCustomersToFirebase}
+          saveOrders={saveOrdersToFirebase}
+          saveContactInfo={saveContactInfoToFirebase}
+          authenticated={authenticated}
+          authReady={authReady}
+          login={async (email, password) => {
+            const admin = await signInAdmin(email, password)
+            setUser(admin)
+            window.location.hash = "/admin"
+          }}
+          logout={async () => {
+            try {
+              await signOutAdmin()
+              setUser(null)
+              window.location.hash = "/login"
+            } catch (error) {
+              setNotice(`Could not sign out of Firebase: ${getErrorMessage(error)}`)
+            }
+          }}
+        />
+        {notice && (
+          <div className="toast" role="status">
+            {notice}
+          </div>
+        )}
+      </>
     )
-  }
-  return page === "admin" ? (
-    !authReady ? (
-      <AuthLoading />
-    ) : user ? (
-      <AdminPage
-        menu={menu}
-        setMenu={setMenu}
-        contactInfo={contactInfo}
-        setContactInfo={setContactInfo}
-        user={user}
-        onSignOut={() => signOut(auth)}
-      />
-    ) : (
-      <AuthLoading />
-    )
-  ) : page === "login" ? (
-    <LoginPage
-      restaurantName={contactInfo.name}
-      onSignIn={(email, password) =>
-        signInWithEmailAndPassword(auth, email, password)
-      }
-    />
-  ) : (
+
+  const filtered = menu.filter(
+    (item) => category === "All" || item.category === category,
+  )
+  const featured = [menu[0], menu[6], menu[10]].filter(
+    (item): item is MenuItem => item !== undefined,
+  )
+  const visible =
+    category === "All" && !expanded
+      ? featured.length === 3
+        ? featured
+        : filtered.slice(0, 3)
+      : filtered
+  return (
     <div className="site-shell">
       <header className="site-header">
         <div className="container header-inner">
-          <Brand name={contactInfo.name} />
+          <Brand />
           <nav
             className={`main-nav ${mobileNav ? "nav-open" : ""}`}
             aria-label="Main navigation"
           >
-            <a className={page === "home" ? "nav-active" : ""} href="#/">
+            <a className="nav-active" href="#/">
               Home
             </a>
             <a
-              className={page === "menu" ? "nav-active" : ""}
-              href="#/menu"
-              onClick={() => setMobileNav(false)}
+              href="#menu"
+              onClick={() => {
+                setExpanded(true)
+                setMobileNav(false)
+              }}
             >
               Our menu
             </a>
-            <a
-              href="#story"
-              onClick={(event) => {
-                event.preventDefault()
-                showHomeSection("story")
-              }}
-            >
-              Our story
-            </a>
-            <a
-              href="#experience"
-              onClick={(event) => {
-                event.preventDefault()
-                showHomeSection("experience")
-              }}
-            >
-              The experience
-            </a>
-            <a
-              href="#visit"
-              onClick={(event) => {
-                event.preventDefault()
-                showHomeSection("visit")
-              }}
-            >
-              Visit us
-            </a>
+            <a href="#story">Our story</a>
+            <a href="#experience">The experience</a>
+            <a href="#visit">Visit us</a>
           </nav>
           <div className="header-actions">
-            <button 
-              className="button button-outline"
-              onClick={requestNotificationPermission}
-              style={{ fontSize: "12px", padding: "6px 12px", display: "flex", alignItems: "center", gap: "5px" }}
-              title="Enable Order Notifications"
-            >
-              {fcmToken ? "Alerts Active" : "Enable Alerts"} <Icon name="flame" />
-            </button>
             <button
               className="icon-button cart-trigger"
               onClick={() => setOverlay("cart")}
@@ -665,8 +890,8 @@ export default function App() {
             </button>
             <a
               className="button button-primary header-order"
-              href="#/menu"
-              onClick={() => setMobileNav(false)}
+              href="#menu"
+              onClick={() => setExpanded(true)}
             >
               Order online <Icon name="arrow" />
             </a>
@@ -683,299 +908,367 @@ export default function App() {
       </header>
 
       <main>
-        {page === "menu" ? (
-          <FullMenuPage
-            menu={menu}
-            category={category}
-            setCategory={setCategory}
-            cart={cart}
-            changeQty={changeQty}
-          />
-        ) : (
-          <>
-            <section className="hero container" aria-labelledby="hero-title">
-              <div className="hero-copy">
-                <div className="eyebrow hero-eyebrow">
-                  <span className="tiny-diamond" /> DERA GHAZI KHAN · PIZZA
-                  RESTAURANT
-                </div>
-                <h1 id="hero-title">{contactInfo.heroTitle}</h1>
-                <p className="hero-description">
-                  {contactInfo.heroDescription}
-                </p>
-                <div className="hero-buttons">
-                  <a className="button button-primary" href="#/menu">
-                    Explore our menu <Icon name="arrow" />
-                  </a>
-                  <button
-                    className="button button-outline"
-                    onClick={() => setOverlay("reservation")}
-                  >
-                    Reserve a table <Icon name="utensils" />
-                  </button>
-                </div>
-                <div className="hero-note">
-                  <span className="small-line" />
-                  <span>4.0 out of 5 on Google · 775 reviews</span>
-                </div>
-              </div>
-              <div className="hero-art">
-                <div className="hero-image-wrap">
-                  <img
-                    className="hero-main-image"
-                    src={GRILL_IMAGE}
-                    alt="Nawabi Pizza from Al Maida Pizza Garden"
-                    fetchPriority="high"
-                    onError={(event) => {
-                      event.currentTarget.src = FALLBACK_IMAGE
-                    }}
-                  />
-                  <div className="image-shade" />
-                  <div className="image-caption">
-                    <span>AL MAIDA MENU HIGHLIGHT</span>
-                    <span>Pizza favourites, made to share.</span>
-                  </div>
-                </div>
-                <div className="hero-inset">
-                  <img
-                    src={FOOD_IMAGE}
-                    alt="Special Pizzratha from Al Maida Pizza Garden"
-                    onError={(event) => {
-                      event.currentTarget.src = FALLBACK_IMAGE
-                    }}
-                  />
-                  <span>Special Pizzratha</span>
-                </div>
-                <div className="heritage-seal">
-                  <Flower />
-                  <span>AL MAIDA PIZZA GARDEN</span>
-                  <strong lang="ur" dir="rtl">
-                    تازہ ذائقہ
-                  </strong>
-                  <small lang="ur" dir="rtl">
-                    ہر نوالہ لاجواب
-                  </small>
-                </div>
-                <div className="hero-side-label">GOOD FOOD. GREAT COMPANY.</div>
-                <div className="hero-art-footer">
-                  <span>01 / MENU HIGHLIGHTS</span>
-                  <span className="art-dots">
-                    <i />
-                    <i />
-                    <i />
-                  </span>
-                </div>
-              </div>
-            </section>
-            <div className="heritage-strip">
-              <div className="container strip-inner">
-                <span>
-                  <Icon name="flame" /> Pizza favourites
-                </span>
-                <span className="strip-diamond">✧</span>
-                <span>
-                  <Icon name="leaf" /> Fries, rolls and sides
-                </span>
-                <span className="strip-diamond">✧</span>
-                <span>
-                  <Icon name="heart" /> Meals and deals
-                </span>
-                <span className="strip-diamond">✧</span>
-                <span>Explore the full menu.</span>
+        <section className="hero container" aria-labelledby="hero-title">
+          <div className="hero-copy">
+            <div className="eyebrow hero-eyebrow">
+              <span className="tiny-diamond" /> BALOCHI SOUL. EXTRAORDINARY
+              FLAVOUR.
+            </div>
+            <h1 id="hero-title">
+              Rooted in tradition.
+              <br />
+              Made to be
+              <br />
+              <em>remembered.</em>
+            </h1>
+            <p className="hero-description">
+              The warmth of our culture. The richness of our flavours.
+              <br className="desktop-break" /> A little piece of home, served at
+              your table.
+            </p>
+            <div className="hero-buttons">
+              <a
+                className="button button-primary"
+                href="#menu"
+                onClick={() => setExpanded(true)}
+              >
+                Explore our menu <Icon name="arrow" />
+              </a>
+              <button
+                className="button button-outline"
+                onClick={() => setOverlay("reservation")}
+              >
+                Reserve a table <Icon name="utensils" />
+              </button>
+            </div>
+            <div className="hero-note">
+              <span className="small-line" />
+              <span>Slow-cooked. Heartfelt. Unmistakably Lalazar.</span>
+            </div>
+          </div>
+          <div className="hero-art">
+            <div className="hero-image-wrap">
+              <img
+                className="hero-main-image"
+                src={GRILL_IMAGE}
+                alt="Spiced chicken skewers roasting over glowing charcoal"
+                fetchPriority="high"
+              />
+              <div className="image-shade" />
+              <div className="image-caption">
+                <span>THE ART OF SLOW COOKING</span>
+                <span>Flame. Flavour. Tradition.</span>
               </div>
             </div>
+            <div className="hero-inset">
+              <img
+                src={FOOD_IMAGE}
+                alt="A colourful, freshly prepared meal served with care"
+              />
+              <span>A taste of togetherness</span>
+            </div>
+            <div className="heritage-seal">
+              <Flower />
+              <span>CRAFTED WITH CARE</span>
+              <strong>ذائقہ اور روایت</strong>
+              <small>BALOCHI AT HEART</small>
+            </div>
+            <div className="hero-side-label">GOOD FOOD. GREAT COMPANY.</div>
+            <div className="hero-art-footer">
+              <span>01 / A WARM WELCOME</span>
+              <span className="art-dots">
+                <i />
+                <i />
+                <i />
+              </span>
+            </div>
+          </div>
+        </section>
+        <div className="heritage-strip">
+          <div className="container strip-inner">
+            <span>
+              <Icon name="flame" /> Charcoal-fired perfection
+            </span>
+            <span className="strip-diamond">✧</span>
+            <span>
+              <Icon name="leaf" /> Fresh ingredients, always
+            </span>
+            <span className="strip-diamond">✧</span>
+            <span>
+              <Icon name="heart" /> A tradition of hospitality
+            </span>
+            <span className="strip-diamond">✧</span>
+            <span>Made with love. Shared with joy.</span>
+          </div>
+        </div>
 
-            <section
-              id="menu"
-              className="menu-section container"
-              aria-labelledby="menu-heading"
+        <section
+          id="menu"
+          className="menu-section container"
+          aria-labelledby="menu-heading"
+        >
+          <div className="section-heading">
+            <div>
+              <span className="eyebrow">FROM OUR KITCHEN, WITH LOVE</span>
+              <h2 id="menu-heading">
+                A menu full of <em>memories.</em>
+              </h2>
+            </div>
+            <p>
+              Familiar favourites. Time-honoured recipes.
+              <br />
+              Every dish has a story. Find yours.
+            </p>
+          </div>
+          <div className="menu-toolbar">
+            <div
+              className="categories"
+              role="group"
+              aria-label="Menu categories"
             >
-              <div className="section-heading">
-                <div>
-                  <span className="eyebrow">
-                    AL MAIDA PIZZA GARDEN · DERA GHAZI KHAN
-                  </span>
-                  <h2 id="menu-heading">
-                    A few favourites, <em>to start.</em>
-                  </h2>
-                </div>
-                <div className="menu-highlight">
-                  <strong>Your next favourite is waiting.</strong>
-                  <p>
-                    From cheesy, oven-fresh pizza to loaded fries and crispy
-                    bites, there is something delicious for every craving.
-                  </p>
-                </div>
-              </div>
-              <MenuCards items={featured} cart={cart} changeQty={changeQty} />
-              <div className="menu-more">
-                <a className="text-link" href="#/menu">
-                  Explore all {menu.length} menu items <Icon name="arrow" />
-                </a>
-                <span>Browse every category, dish and listed price.</span>
-              </div>
-            </section>
-
-            <section id="story" className="story-section">
-              <div className="container story-grid">
-                <div className="story-image">
-                  <img
-                    src={INTERIOR_IMAGE}
-                    alt="Oven Baked Wings from Al Maida Pizza Garden"
-                    loading="lazy"
-                    onError={(event) => {
-                      event.currentTarget.src = FALLBACK_IMAGE
-                    }}
-                  />
-                  <div className="story-image-note">
-                    <Flower />
-                    <span>
-                      Good food.
-                      <br />
-                      <em>Great company.</em>
-                    </span>
+              {CATEGORIES.map((value) => (
+                <button
+                  key={value}
+                  className={`category ${category === value ? "selected" : ""}`}
+                  aria-pressed={category === value}
+                  onClick={() => {
+                    setCategory(value)
+                    setExpanded(value !== "All")
+                  }}
+                >
+                  {value === "All" ? "All dishes" : value}
+                </button>
+              ))}
+            </div>
+            <span className="menu-count">
+              {menu.length} dishes. Endless delight.
+            </span>
+          </div>
+          <div className="menu-grid">
+            {visible.map((item) => {
+              const qty = cart.find((value) => value.id === item.id)?.qty || 0
+              return (
+                <article className="menu-card" key={item.id}>
+                  <div className="menu-image">
+                    <FoodImage item={item} />
+                    {item.badge && (
+                      <span className="dish-badge">
+                        <span className="tiny-diamond" /> {item.badge}
+                      </span>
+                    )}
+                    {item.available === false && (
+                      <span className="unavailable-badge">
+                        Currently unavailable
+                      </span>
+                    )}
                   </div>
-                </div>
-                <div className="story-copy">
-                  <span className="eyebrow">OUR PROMISE</span>
-                  <h2>
-                    A quick bite,
-                    <br />
-                    <em>a memorable meal.</em>
-                  </h2>
-                  <p>
-                    Al Maida Pizza Garden is listed on Railway Road, Block A, in
-                    Dera Ghazi Khan. Its menu features deep pan, square pan,
-                    crown and stuffed pizzas alongside pasta, rolls, fries and
-                    meals.
-                  </p>
-                  <p>
-                    Browse the listed dishes and current prices, then contact
-                    the restaurant directly to confirm availability, serving
-                    options and delivery details.
-                  </p>
-                  <a className="text-link" href="#experience">
-                    Discover the experience <Icon name="arrow" />
-                  </a>
-                  <div className="story-signature">
-                    Listed in <span>Dera Ghazi Khan</span>
-                  </div>
-                </div>
-              </div>
-            </section>
-
-            <section id="experience" className="experience-section container">
-              <div className="center-heading">
-                <span className="eyebrow">SAVOUR THE MOMENT</span>
-                <h2>
-                  Flavour-packed favourites, <em>made to share.</em>
-                </h2>
-                <p>
-                  Pizzas, burgers, wraps, and sides for every craving and every
-                  occasion.
-                </p>
-              </div>
-              <div className="experience-grid">
-                {[
-                  {
-                    icon: "flame" as const,
-                    number: "01",
-                    title: "Freshly made classics",
-                    copy: "From cheesy pizzas to loaded fries, every dish is cooked to order and served hot.",
-                  },
-                  {
-                    icon: "heart" as const,
-                    number: "02",
-                    title: "A place for every crew",
-                    copy: "The listed menu includes fast-food combos and pizza deals for sharing.",
-                  },
-                  {
-                    icon: "message" as const,
-                    number: "03",
-                    title: "Order in a tap",
-                    copy: "Pick your favourites, share your order, and let us handle the rest on WhatsApp.",
-                  },
-                ].map((item) => (
-                  <article key={item.number}>
-                    <div className="experience-top">
-                      <Icon name={item.icon} />
-                      <span>{item.number}</span>
+                  <div className="menu-card-content">
+                    <div className="dish-category">{item.category}</div>
+                    <div className="dish-title">
+                      <h3>{item.name}</h3>
+                      <span lang="ur" dir="rtl">
+                        {item.urdu}
+                      </span>
                     </div>
-                    <h3>{item.title}</h3>
-                    <p>{item.copy}</p>
-                  </article>
-                ))}
-              </div>
-            </section>
+                    <p>{item.description}</p>
+                    <div className="dish-bottom">
+                      <strong>
+                        {MONEY(item.price)}
+                        <small> / serving</small>
+                      </strong>
+                      {qty ? (
+                        <div className="quantity-control">
+                          <button
+                            aria-label={`Remove one ${item.name}`}
+                            onClick={() => changeQty(item, -1)}
+                          >
+                            <Icon name="minus" />
+                          </button>
+                          <span aria-live="polite">{qty}</span>
+                          <button
+                            aria-label={`Add one ${item.name}`}
+                            onClick={() => changeQty(item, 1)}
+                          >
+                            <Icon name="plus" />
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          className="add-button"
+                          disabled={item.available === false}
+                          onClick={() => changeQty(item, 1)}
+                          aria-label={`Add ${item.name} to order`}
+                        >
+                          <span>Add to order</span>
+                          <Icon name="plus" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+          {category === "All" && (
+            <div className="menu-more">
+              <button
+                className="text-link"
+                onClick={() => setExpanded(!expanded)}
+              >
+                {expanded ? "Show our favourites" : "Discover the full menu"}{" "}
+                <Icon name="arrow" />
+              </button>
+              <span>
+                {expanded
+                  ? `All ${menu.length} dishes, freshly made for you.`
+                  : "Something for every craving."}
+              </span>
+            </div>
+          )}
+        </section>
 
-            <section id="visit" className="visit-section">
-              <Flower className="visit-flower" />
-              <div className="container visit-inner">
-                <div>
-                  <span className="eyebrow">
-                    VISIT {contactInfo.name.toUpperCase()}
-                  </span>
-                  <h2>Visit us soon.</h2>
-                  <p>{contactInfo.address}</p>
-                </div>
-                <div className="visit-actions">
-                  <button
-                    className="button button-gold"
-                    onClick={() => setOverlay("reservation")}
-                  >
-                    Reserve a table <Icon name="arrow" />
-                  </button>
-                  <a
-                    href={`https://wa.me/${whatsapp}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="visit-whatsapp"
-                  >
-                    <Icon name="message" /> Let's talk on WhatsApp
-                  </a>
-                  <a
-                    className="visit-whatsapp"
-                    href={`tel:${contactInfo.phone.replace(/\D/g, "")}`}
-                  >
-                    Call {contactInfo.phone}
-                  </a>
-                  <small>{contactInfo.hours}</small>
-                </div>
+        <section id="story" className="story-section">
+          <div className="container story-grid">
+            <div className="story-image">
+              <img
+                src={INTERIOR_IMAGE}
+                alt="Warm wood, intimate lighting and welcoming restaurant tables"
+                loading="lazy"
+              />
+              <div className="story-image-note">
+                <Flower />
+                <span>
+                  Come as a guest.
+                  <br />
+                  <em>Leave as family.</em>
+                </span>
               </div>
-            </section>
-          </>
-        )}
+            </div>
+            <div className="story-copy">
+              <span className="eyebrow">OUR ROOTS. OUR HEART.</span>
+              <h2>
+                More than a cafe.
+                <br />
+                <em>A feeling of home.</em>
+              </h2>
+              <p>
+                In Balochi culture, a shared meal is more than food. It is a
+                welcome, a conversation, a connection. At Lalazar, we bring that
+                spirit to every table.
+              </p>
+              <p>
+                From the first glow of our charcoal to the last comforting sip
+                of chai, we believe in taking our time. With our food. With our
+                guests. With the moments that matter.
+              </p>
+              <a className="text-link" href="#experience">
+                Experience Lalazar <Icon name="arrow" />
+              </a>
+              <div className="story-signature">
+                With warmth, <span>The Lalazar family</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="experience" className="experience-section container">
+          <div className="center-heading">
+            <span className="eyebrow">SAVOUR THE MOMENT</span>
+            <h2>
+              Some things are better <em>together.</em>
+            </h2>
+            <p>
+              A table for two, a feast for the family, or simply a cup of chai.
+            </p>
+          </div>
+          <div className="experience-grid">
+            {[
+              {
+                icon: "flame" as const,
+                number: "01",
+                title: "Food with a soul",
+                copy: "Bold Balochi flavours, patient preparation, and recipes that honour our roots.",
+              },
+              {
+                icon: "heart" as const,
+                number: "02",
+                title: "A place to belong",
+                copy: "Warm welcomes and unhurried moments. There is always a seat for you.",
+              },
+              {
+                icon: "message" as const,
+                number: "03",
+                title: "Your favourites, at home",
+                copy: "Choose your dishes, share your details, and send your order directly on WhatsApp.",
+              },
+            ].map((item) => (
+              <article key={item.number}>
+                <div className="experience-top">
+                  <Icon name={item.icon} />
+                  <span>{item.number}</span>
+                </div>
+                <h3>{item.title}</h3>
+                <p>{item.copy}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section id="visit" className="visit-section">
+          <Flower className="visit-flower" />
+          <div className="container visit-inner">
+            <div>
+              <span className="eyebrow">YOUR TABLE IS WAITING</span>
+              <h2>
+                Good food.
+                <br />
+                <em>Even better company.</em>
+              </h2>
+              <p>Make a little time for something delicious.</p>
+            </div>
+            <div className="visit-actions">
+              <button
+                className="button button-gold"
+                onClick={() => setOverlay("reservation")}
+              >
+                Reserve a table <Icon name="arrow" />
+              </button>
+              <a
+                href={`https://wa.me/${whatsapp}`}
+                target="_blank"
+                rel="noreferrer"
+                className="visit-whatsapp"
+              >
+                <Icon name="message" /> Let's talk on WhatsApp
+              </a>
+              <small>Reservations are confirmed by our team.</small>
+            </div>
+          </div>
+        </section>
       </main>
       <footer className="site-footer container">
         <div className="footer-top">
-          <Brand name={contactInfo.name} />
+          <Brand />
           <p>
-            Hot pizzas.
+            Balochi flavours.
             <br />
-            Crispy bites. Great company.
+            Heartfelt hospitality.
           </p>
           <div className="footer-links">
-            <a href="#/menu">Our menu</a>
-            <a
-              href="#story"
-              onClick={(event) => {
-                event.preventDefault()
-                showHomeSection("story")
-              }}
-            >
-              Our story
+            <a href="#menu">Our menu</a>
+            <a href="#story">Our story</a>
+            <a href="#/login">
+              Admin login <Icon name="lock" />
             </a>
-            <a href="#/login">Admin</a>
           </div>
         </div>
         <div className="footer-bottom">
           <span>
-            © {new Date().getFullYear()} {contactInfo.name}. All rights
-            reserved.
+            © {new Date().getFullYear()} Lalazar Cafe. All rights reserved.
           </span>
-          <span>Freshly made for every craving.</span>
+          <span>Made with care. Served with love.</span>
           <span lang="ur" dir="rtl">
-            المیڈا پیزا گارڈن — تازہ ذائقہ
+            لالہ زار کیفے — ذائقہ اور محبت
           </span>
         </div>
       </footer>
@@ -991,41 +1284,6 @@ export default function App() {
           <Icon name="arrow" />
         </button>
       )}
-      {/* Real-time Broadcast Notification Banner */}
-      {pushedMessage && (
-        <div style={{
-          position: "fixed",
-          bottom: "20px",
-          right: "20px",
-          backgroundColor: "#d9381e",
-          color: "#ffffff",
-          padding: "16px 24px",
-          borderRadius: "8px",
-          boxShadow: "0 4px 15px rgba(0, 0, 0, 0.2)",
-          zIndex: 9999,
-          display: "flex",
-          alignItems: "center",
-          gap: "12px",
-          maxWidth: "350px",
-          fontSize: "15px",
-          fontWeight: "bold"
-        }}>
-          <span>📢 {pushedMessage}</span>
-          <button 
-            onClick={() => setPushedMessage("")}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: "#ffffff",
-              fontSize: "18px",
-              cursor: "pointer",
-              marginLeft: "auto"
-            }}
-          >
-            ✕
-          </button>
-        </div>
-      )}
       {overlay === "cart" && (
         <Dialog drawer title="Your order" close={close}>
           <div className="cart-content">
@@ -1035,10 +1293,7 @@ export default function App() {
                   <FoodImage item={item} />
                   <div>
                     <h3>{item.name}</h3>
-                    <small>
-                      {item.priceFrom ? "From " : ""}
-                      {MONEY(item.price)}
-                    </small>
+                    <small>{MONEY(item.price)}</small>
                     <div className="quantity-control">
                       <button
                         aria-label={`Remove one ${item.name}`}
@@ -1055,10 +1310,7 @@ export default function App() {
                       </button>
                     </div>
                   </div>
-                  <strong>
-                    {item.priceFrom ? "From " : ""}
-                    {MONEY(item.price * item.qty)}
-                  </strong>
+                  <strong>{MONEY(item.price * item.qty)}</strong>
                 </div>
               ))
             ) : (
@@ -1070,7 +1322,9 @@ export default function App() {
                   className="button button-primary"
                   onClick={() => {
                     close()
-                    window.location.hash = "#/menu"
+                    document
+                      .getElementById("menu")
+                      ?.scrollIntoView({ behavior: "smooth" })
                   }}
                 >
                   Explore the menu <Icon name="arrow" />
@@ -1101,18 +1355,54 @@ export default function App() {
           <Checkout
             cart={cart}
             total={total}
-            onComplete={() => {
+            openWhatsApp={openWhatsApp}
+            onHandoff={async (customer) => {
+              const uniqueId = crypto.randomUUID().replace(/-/g, "").slice(0, 10)
+              const orderId = `LC-${Date.now()}-${uniqueId}`
+              const createdAt = new Date().toISOString()
+              const customerId = `CUST-${uniqueId}`
+              const nextOrder: CustomerOrderRecord = {
+                id: orderId,
+                customerId,
+                customerName: customer.name,
+                customerPhone: customer.phone,
+                customerAddress: customer.address,
+                items: cart.map((item) => ({
+                  id: item.id,
+                  name: item.name,
+                  qty: item.qty,
+                  price: item.price,
+                })),
+                subtotal: total,
+                status: "Pending",
+                createdAt,
+                updatedAt: createdAt,
+                deadlineMinutes: 45,
+                notes: customer.notes,
+                timeline: createTimeline(createdAt, "Pending"),
+              }
+              const nextCustomer: CustomerRecord = {
+                id: customerId,
+                name: customer.name,
+                phone: customer.phone,
+                email: "",
+                address: customer.address,
+                notes: customer.notes,
+                createdAt,
+                orderId,
+              }
+              await createOrder(nextOrder, nextCustomer)
               setCart([])
               close()
               setNotice(
-                "WhatsApp opened. Send the message so our team can confirm your order.",
+                "Your request was saved securely. Please send the WhatsApp message to complete the request.",
               )
             }}
           />
         </Dialog>
       )}
       {overlay === "reservation" && (
-        <Dialog title="Request a table." close={close}>
+        <Dialog title="A seat at our table." close={close}>
           <Reservation
             openWhatsApp={openWhatsApp}
             complete={() => {
@@ -1135,7 +1425,14 @@ export default function App() {
 }
 
 function FoodImage({ item }: { item: MenuItem }) {
-  const src = item.image || FALLBACK_IMAGE
+  const src =
+    item.id === 1
+      ? GRILL_IMAGE
+      : item.id === 7
+        ? FOOD_IMAGE
+        : item.category === "Rice"
+          ? "/images/rice.jpg"
+          : item.image
   return (
     <img
       src={src}
@@ -1143,1694 +1440,29 @@ function FoodImage({ item }: { item: MenuItem }) {
       loading="lazy"
       onError={(e) => {
         e.currentTarget.onerror = null
-        e.currentTarget.src = FALLBACK_IMAGE
+        e.currentTarget.src = FOOD_IMAGE
       }}
     />
-  )
-}
-
-function MenuCards({
-  items,
-  cart,
-  changeQty,
-}: {
-  items: MenuItem[]
-  cart: CartItem[]
-  changeQty: (item: MenuItem, delta: number) => void
-}) {
-  return (
-    <div className="menu-grid">
-      {items.map((item) => {
-        const qty = cart.find((value) => value.id === item.id)?.qty || 0
-        return (
-          <article className="menu-card" key={item.id}>
-            <div className="menu-image">
-              <FoodImage item={item} />
-              {item.badge && (
-                <span className="dish-badge">
-                  <span className="tiny-diamond" /> {item.badge}
-                </span>
-              )}
-              {item.available === false && (
-                <span className="unavailable-badge">Currently unavailable</span>
-              )}
-            </div>
-            <div className="menu-card-content">
-              <div className="dish-category">{item.category}</div>
-              <div className="dish-title">
-                <h3>{item.name}</h3>
-                {item.urdu && (
-                  <span lang="ur" dir="rtl">
-                    {item.urdu}
-                  </span>
-                )}
-              </div>
-              {item.description && <p>{item.description}</p>}
-              <div className="dish-bottom">
-                <strong>
-                  {item.priceFrom ? "From " : ""}
-                  {MONEY(item.price)}
-                </strong>
-                {qty ? (
-                  <div className="quantity-control">
-                    <button
-                      aria-label={`Remove one ${item.name}`}
-                      onClick={() => changeQty(item, -1)}
-                    >
-                      <Icon name="minus" />
-                    </button>
-                    <span aria-live="polite">{qty}</span>
-                    <button
-                      aria-label={`Add one ${item.name}`}
-                      onClick={() => changeQty(item, 1)}
-                    >
-                      <Icon name="plus" />
-                    </button>
-                  </div>
-                ) : (
-                  <button
-                    className="add-button"
-                    disabled={item.available === false}
-                    onClick={() => changeQty(item, 1)}
-                    aria-label={`Add ${item.name} to order`}
-                  >
-                    <span>Add to order</span>
-                    <Icon name="plus" />
-                  </button>
-                )}
-              </div>
-            </div>
-          </article>
-        )
-      })}
-    </div>
-  )
-}
-
-function FullMenuPage({
-  menu,
-  category,
-  setCategory,
-  cart,
-  changeQty,
-}: {
-  menu: MenuItem[]
-  category: string
-  setCategory: (category: string) => void
-  cart: CartItem[]
-  changeQty: (item: MenuItem, delta: number) => void
-}) {
-  const categories = [
-    "All",
-    ...new Set(menu.map((item) => item.category)),
-  ].sort((left, right) =>
-    left === "All" ? -1 : right === "All" ? 1 : left.localeCompare(right),
-  )
-  const filtered = menu.filter(
-    (item) => category === "All" || item.category === category,
-  )
-  return (
-    <section id="menu" className="menu-page" aria-labelledby="menu-heading">
-      <div className="menu-page-banner">
-        <div className="container menu-page-banner-inner">
-          <div>
-            <span className="eyebrow">
-              AL MAIDA PIZZA GARDEN · DERA GHAZI KHAN
-            </span>
-            <h1 id="menu-heading">
-              The full menu, <em>your way.</em>
-            </h1>
-            <p>
-              Big flavours, fresh favourites and feel-good bites—find the
-              perfect thing to share.
-            </p>
-          </div>
-          <a className="button button-outline menu-home-link" href="#/">
-            <Icon name="arrow" className="back-arrow" /> Back to home
-          </a>
-        </div>
-      </div>
-      <div className="container menu-section menu-page-content">
-        <div className="menu-toolbar">
-          <div className="menu-filter">
-            <label htmlFor="menu-category">Browse by category</label>
-            <select
-              id="menu-category"
-              value={category}
-              onChange={(event) => setCategory(event.currentTarget.value)}
-            >
-              {categories.map((value) => (
-                <option key={value} value={value}>
-                  {value === "All" ? "All dishes" : value}
-                </option>
-              ))}
-            </select>
-          </div>
-          <span className="menu-count">
-            {category === "All"
-              ? `${menu.length} dishes to discover`
-              : `${filtered.length} ${category.toLowerCase()} dishes`}
-          </span>
-        </div>
-        <div className="menu-highlight menu-page-highlight">
-          <strong>Good food makes every get-together better.</strong>
-          <p>
-            Make it a pizza night, load up on fries or choose a little of
-            everything. Prices marked “From” are starting prices; availability
-            and final totals can be confirmed with our team.
-          </p>
-        </div>
-        <MenuCards items={filtered} cart={cart} changeQty={changeQty} />
-      </div>
-    </section>
-  )
-}
-
-type AdminTab = "overview" | "menu" | "orders" | "customers" | "settings"
-type OrderStatus = "pending" | "confirmed" | "preparing" | "completed" | "cancelled"
-type AnalyticsPeriod = "day" | "week" | "month"
-
-interface RestaurantOrder {
-  id: string
-  customer: {
-    name: string
-    address: string
-    phone: string
-    notes: string
-  }
-  items: {
-    id: number
-    name: string
-    qty: number
-    price: number
-    priceFrom: boolean
-  }[]
-  subtotal: number
-  status: OrderStatus
-  createdAt: Timestamp | null
-}
-
-const ORDER_STATUSES: OrderStatus[] = [
-  "pending",
-  "confirmed",
-  "preparing",
-  "completed",
-  "cancelled",
-]
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
-function isOrderStatus(value: unknown): value is OrderStatus {
-  return (
-    typeof value === "string" &&
-    ORDER_STATUSES.some((status) => status === value)
-  )
-}
-
-function isRestaurantOrderItem(
-  item: unknown,
-): item is RestaurantOrder["items"][number] {
-  return (
-    isRecord(item) &&
-    Number.isInteger(item.id) &&
-    typeof item.name === "string" &&
-    Number.isInteger(item.qty) &&
-    Number(item.qty) > 0 &&
-    Number.isFinite(item.price) &&
-    Number(item.price) >= 0 &&
-    typeof item.priceFrom === "boolean"
-  )
-}
-
-function parseRestaurantOrder(
-  id: string,
-  data: unknown,
-): RestaurantOrder | null {
-  if (
-    !isRecord(data) ||
-    !isRecord(data.customer) ||
-    !Array.isArray(data.items) ||
-    typeof data.customer.name !== "string" ||
-    typeof data.customer.address !== "string" ||
-    typeof data.customer.phone !== "string" ||
-    typeof data.customer.notes !== "string" ||
-    !Number.isFinite(data.subtotal) ||
-    !isOrderStatus(data.status) ||
-    !(data.createdAt === null || data.createdAt instanceof Timestamp)
-  ) {
-    return null
-  }
-  const items = data.items
-  const validItems = items.filter(isRestaurantOrderItem)
-  if (validItems.length === 0 || validItems.length !== items.length) {
-    return null
-  }
-  return {
-    id,
-    customer: {
-      name: data.customer.name,
-      address: data.customer.address,
-      phone: data.customer.phone,
-      notes: data.customer.notes,
-    },
-    items: validItems.map((item) => ({
-      id: item.id,
-      name: item.name,
-      qty: item.qty,
-      price: item.price,
-      priceFrom: item.priceFrom,
-    })),
-    subtotal: Number(data.subtotal),
-    status: data.status,
-    createdAt: data.createdAt,
-  }
-}
-
-function orderDate(order: RestaurantOrder) {
-  return order.createdAt ? order.createdAt.toDate().toLocaleString("en-PK", {
-        dateStyle: "medium",
-        timeStyle: "short",
-      }) : "Just now"
-}
-
-function getPeriodStart(period: AnalyticsPeriod, now = new Date()) {
-  const start = new Date(now)
-  if (period === "day") {
-    start.setHours(0, 0, 0, 0)
-  } else if (period === "week") {
-    start.setDate(start.getDate() - ((start.getDay() + 6) % 7))
-    start.setHours(0, 0, 0, 0)
-  } else {
-    start.setDate(1)
-    start.setHours(0, 0, 0, 0)
-  }
-  return start
-}
-
-function AdminPage({
-  menu,
-  setMenu,
-  contactInfo,
-  setContactInfo,
-  user,
-  onSignOut,
-}: {
-  menu: MenuItem[]
-  setMenu: (items: MenuItem[]) => void
-  contactInfo: ContactInfo
-  setContactInfo: (info: ContactInfo) => void
-  user: User
-  onSignOut: () => Promise<void>
-}) {
-  const [tab, setTab] = useState<AdminTab>("overview")
-  const [query, setQuery] = useState("")
-  const [signOutError, setSignOutError] = useState("")
-  const [adminError, setAdminError] = useState("")
-  const [adminNotice, setAdminNotice] = useState("")
-  const [orders, setOrders] = useState<RestaurantOrder[]>([])
-  const [ordersLoading, setOrdersLoading] = useState(true)
-  const [ordersError, setOrdersError] = useState("")
-  const [updatingOrderId, setUpdatingOrderId] = useState("")
-  const [period, setPeriod] = useState<AnalyticsPeriod>("week")
-  const [menuModal, setMenuModal] = useState(false)
-  const [editingMenu, setEditingMenu] = useState<MenuItem | null>(null)
-  const [menuSaving, setMenuSaving] = useState(false)
-  const [editingCustomer, setEditingCustomer] = useState<{
-    customerKey: string
-    phone: string
-    name: string
-    address: string
-    notes: string
-  } | null>(null)
-  const [customerSaving, setCustomerSaving] = useState(false)
-  const [settingsSaving, setSettingsSaving] = useState(false)
-  const tabs: { key: AdminTab; label: string; icon: IconName }[] = [
-    { key: "overview", label: "Overview", icon: "grid" },
-    { key: "menu", label: "Menu management", icon: "utensils" },
-    { key: "orders", label: "Orders", icon: "bag" },
-    { key: "customers", label: "Customers", icon: "check" },
-    { key: "settings", label: "Restaurant settings", icon: "settings" },
-  ]
-  const title = tabs.find((item) => item.key === tab)?.label ?? "Overview"
-  const filteredMenu = menu.filter((item) =>
-    `${item.name} ${item.category}`.toLowerCase().includes(query.toLowerCase()),
-  )
-  const categories = [...new Set(menu.map((item) => item.category))].sort()
-  useEffect(() => {
-    if (user.email?.toLowerCase() !== ADMIN_EMAIL) return
-    let cancelled = false
-    const initializeAdminData = async () => {
-      try {
-        const menuSnapshot = await getDocs(collection(db, "menuItems"))
-        if (!cancelled && menuSnapshot.empty) {
-          const batch = writeBatch(db)
-          MENU.forEach((item) =>
-            batch.set(doc(db, "menuItems", String(item.id)), item),
-          )
-          await batch.commit()
-        }
-        const settingsRef = doc(db, "settings", "restaurant")
-        const settingsSnapshot = await getDoc(settingsRef)
-        if (!cancelled && !settingsSnapshot.exists()) {
-          await setDoc(settingsRef, DEFAULT_CONTACT_INFO)
-        }
-      } catch (cause) {
-        if (!cancelled) {
-          setAdminError(
-            cause instanceof FirebaseError && cause.code === "permission-denied"
-              ? "Admin data setup was denied by Firestore rules. Deploy the latest rules and reload."
-              : "Admin data could not be initialized. Check your connection and Firestore setup.",
-          )
-        }
-      }
-    }
-    void initializeAdminData()
-    return () => {
-      cancelled = true
-    }
-  }, [user.email])
-  useEffect(() => {
-    if (user.email?.toLowerCase() !== ADMIN_EMAIL) {
-      setOrdersLoading(false)
-      return
-    }
-    const ordersQuery = firestoreQuery(
-      collection(db, "orders"),
-      orderBy("createdAt", "desc"),
-      limit(1000),
-    )
-    return onSnapshot(
-      ordersQuery,
-      (snapshot) => {
-        const parsedOrders = snapshot.docs.map((orderDoc) =>
-          parseRestaurantOrder(orderDoc.id, orderDoc.data()),
-        )
-        const validOrders = parsedOrders.filter(
-          (order): order is RestaurantOrder => order !== null,
-        )
-        setOrders(validOrders)
-        setOrdersError(
-          validOrders.length === parsedOrders.length
-            ? ""
-            : "Some saved orders have invalid data and were hidden. Review those records in the Firebase console.",
-        )
-        setOrdersLoading(false)
-      },
-      (cause) => {
-        setOrdersError(
-          cause instanceof FirebaseError && cause.code === "permission-denied"
-            ? "Order access was denied. Confirm that you are signed in to the correct Firebase project and that the latest Firestore rules are deployed."
-            : "Live orders could not be loaded. Please refresh and try again.",
-        )
-        setOrdersLoading(false)
-      },
-    )
-  }, [user])
-  const updateOrderStatus = async (orderId: string, status: OrderStatus) => {
-    setUpdatingOrderId(orderId)
-    setOrdersError("")
-    try {
-      await updateDoc(doc(db, "orders", orderId), { status })
-    } catch (cause) {
-      setOrdersError(
-        cause instanceof FirebaseError && cause.code === "permission-denied"
-          ? "You are not authorized to update this order."
-          : "Order status could not be updated. Please try again.",
-      )
-    } finally {
-      setUpdatingOrderId("")
-    }
-  }
-  const saveMenuItem = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const data = new FormData(event.currentTarget)
-    const name = String(data.get("name")).trim()
-    const category = String(data.get("category")).trim()
-    const price = Number(data.get("price"))
-    const image = String(data.get("image")).trim() || FALLBACK_IMAGE
-    if (!name || !category || !Number.isFinite(price) || price <= 0) {
-      setAdminError("Enter a name, category, and valid price for this item.")
-      return
-    }
-    const id =
-      editingMenu?.id ?? Math.max(0, ...menu.map((item) => item.id)) + 1
-    const item: MenuItem = {
-      id,
-      name,
-      urdu: String(data.get("urdu")).trim(),
-      description: String(data.get("description")).trim(),
-      price,
-      priceFrom: data.get("priceFrom") === "on",
-      category,
-      image,
-      badge: String(data.get("badge")).trim() || undefined,
-      available: data.get("available") === "on",
-    }
-    const cleanItem = Object.fromEntries(
-      Object.entries(item).filter(([, value]) => value !== undefined),
-    )
-    setMenuSaving(true)
-    setAdminError("")
-    try {
-      await setDoc(doc(db, "menuItems", String(id)), cleanItem)
-      setMenu(
-        [...menu.filter((current) => current.id !== id), item].sort(
-          (left, right) => left.id - right.id,
-        ),
-      )
-      setMenuModal(false)
-      setAdminNotice(`${name} saved and published to the website.`)
-    } catch (cause) {
-      setAdminError(
-        cause instanceof FirebaseError && cause.code === "permission-denied"
-          ? "You are not allowed to edit the menu. Verify the admin account and Firestore rules."
-          : "The menu item could not be saved. Please try again.",
-      )
-    } finally {
-      setMenuSaving(false)
-    }
-  }
-  const removeMenuItem = async (item: MenuItem) => {
-    if (!window.confirm(`Remove ${item.name} from the public menu?`)) return
-    setAdminError("")
-    try {
-      await deleteDoc(doc(db, "menuItems", String(item.id)))
-      setMenu(menu.filter((current) => current.id !== item.id))
-      setAdminNotice(`${item.name} was removed from the website menu.`)
-    } catch (cause) {
-      setAdminError(
-        cause instanceof FirebaseError && cause.code === "permission-denied"
-          ? "You are not allowed to remove menu items."
-          : "The menu item could not be removed. Please try again.",
-      )
-    }
-  }
-  const saveCustomer = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!editingCustomer) return
-    const data = new FormData(event.currentTarget)
-    const customer = {
-      name: String(data.get("name")).trim(),
-      address: String(data.get("address")).trim(),
-      phone: String(data.get("phone")).trim(),
-      notes: String(data.get("notes")).trim(),
-    }
-    if (
-      !customer.name ||
-      !customer.address ||
-      !/^[+\d\s()-]{10,20}$/.test(customer.phone) ||
-      customer.phone.replace(/\D/g, "").length < 10
-    ) {
-      setAdminError("Enter the customer's name, address, and valid phone.")
-      return
-    }
-    const matchingOrders = orders.filter(
-      (order) =>
-        order.customer.phone.replace(/\D/g, "") === editingCustomer.customerKey,
-    )
-    setCustomerSaving(true)
-    setAdminError("")
-    try {
-      for (let index = 0; index < matchingOrders.length; index += 450) {
-        const batch = writeBatch(db)
-        matchingOrders.slice(index, index + 450).forEach((order) => {
-          batch.update(doc(db, "orders", order.id), { customer })
-        })
-        await batch.commit()
-      }
-      setEditingCustomer(null)
-      setAdminNotice(
-        `Customer details updated across ${matchingOrders.length} recent order(s).`,
-      )
-    } catch (cause) {
-      setAdminError(
-        cause instanceof FirebaseError && cause.code === "permission-denied"
-          ? "You are not allowed to edit customer records. Check the Firestore rules."
-          : "Customer details could not be updated. Please try again.",
-      )
-    } finally {
-      setCustomerSaving(false)
-    }
-  }
-  const saveRestaurantSettings = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const data = new FormData(event.currentTarget)
-    const nextSettings: ContactInfo = {
-      name: String(data.get("name")).trim(),
-      phone: String(data.get("phone")).trim(),
-      address: String(data.get("address")).trim(),
-      hours: String(data.get("hours")).trim(),
-      heroTitle: String(data.get("heroTitle")).trim(),
-      heroDescription: String(data.get("heroDescription")).trim(),
-    }
-    if (Object.values(nextSettings).some((value) => !value)) {
-      setAdminError("Complete all website details before saving.")
-      return
-    }
-    setSettingsSaving(true)
-    setAdminError("")
-    try {
-      await setDoc(doc(db, "settings", "restaurant"), nextSettings)
-      setContactInfo(nextSettings)
-      setAdminNotice("Website details saved and published.")
-    } catch (cause) {
-      setAdminError(
-        cause instanceof FirebaseError && cause.code === "permission-denied"
-          ? "You are not allowed to change website details."
-          : "Website details could not be saved. Please try again.",
-      )
-    } finally {
-      setSettingsSaving(false)
-    }
-  }
-  const today = new Date().toDateString()
-  const todaysOrders = orders.filter(
-    (order) => order.createdAt?.toDate().toDateString() === today,
-  ).length
-  const recentCustomers = new Set(orders.map((order) => order.customer.phone))
-  const periodStart = getPeriodStart(period)
-  const periodOrders = orders.filter(
-    (order) =>
-      order.createdAt &&
-      order.createdAt.toDate().getTime() >= periodStart.getTime(),
-  )
-  const revenueOrders = periodOrders.filter((order) =>
-    ["confirmed", "preparing", "completed"].includes(order.status),
-  )
-  const paidRevenue = revenueOrders.reduce(
-    (sum, order) => sum + order.subtotal,
-    0,
-  )
-  const bucketCount =
-    period === "day" ? 24 : period === "week" ? 7 : new Date().getDate()
-  const revenueBuckets = Array.from({ length: bucketCount }, (_, index) => {
-    const label =
-      period === "day"
-        ? `${index % 12 || 12}${index < 12 ? "a" : "p"}`
-        : period === "week"
-          ? new Date(
-              periodStart.getFullYear(),
-              periodStart.getMonth(),
-              periodStart.getDate() + index,
-            ).toLocaleDateString("en-PK", { weekday: "short" })
-          : String(index + 1)
-    return { label, value: 0 }
-  })
-  revenueOrders.forEach((order) => {
-    if (!order.createdAt) return
-    const date = order.createdAt.toDate()
-    const index =
-      period === "day"
-        ? date.getHours()
-        : period === "week"
-          ? Math.floor(
-              (new Date(
-                date.getFullYear(),
-                date.getMonth(),
-                date.getDate(),
-              ).getTime() -
-                periodStart.getTime()) /
-                86400000,
-            )
-          : date.getDate() - 1
-    if (index >= 0 && index < revenueBuckets.length) {
-      revenueBuckets[index].value += order.subtotal
-    }
-  })
-  const maximumRevenue = Math.max(
-    1,
-    ...revenueBuckets.map((bucket) => bucket.value),
-  )
-  const bestSellers = new Map<string, number>()
-  revenueOrders.forEach((order) =>
-    order.items.forEach((item) =>
-      bestSellers.set(item.name, (bestSellers.get(item.name) ?? 0) + item.qty),
-    ),
-  )
-  const bestSellingItems = [...bestSellers.entries()]
-    .sort((left, right) => right[1] - left[1])
-    .slice(0, 5)
-  const orderStatusCounts = ORDER_STATUSES.map((status) => ({
-    status,
-    count: periodOrders.filter((order) => order.status === status).length,
-  }))
-  const customerMap = new Map<string, {
-    phone: string
-    name: string
-    address: string
-    notes: string
-    orders: RestaurantOrder[]
-  }>()
-  orders.forEach((order) => {
-    const key = order.customer.phone.replace(/\D/g, "")
-    const customer = customerMap.get(key)
-    if (customer) customer.orders.push(order)
-    else
-      customerMap.set(key, {
-        phone: order.customer.phone,
-        name: order.customer.name,
-        address: order.customer.address,
-        notes: order.customer.notes,
-        orders: [order],
-      })
-  })
-  const customers = [...customerMap.values()]
-
-  if (user.email?.toLowerCase() !== ADMIN_EMAIL) {
-    return (
-      <main className="auth-loading">
-        <span className="eyebrow">ADMIN ACCESS RESTRICTED</span>
-        <h1>Administrator account required</h1>
-        <p>
-          This workspace is restricted to {ADMIN_EMAIL}. The current signed-in
-          account is {user.email ?? "missing an email address"}.
-        </p>
-        <button className="button button-primary" onClick={onSignOut}>
-          Sign out
-        </button>
-      </main>
-    )
-  }
-  return (
-    <div className="admin-layout">
-      <aside className="admin-sidebar">
-        <Brand light name={contactInfo.name} />
-        <span className="eyebrow">RESTAURANT WORKSPACE</span>
-        <nav aria-label="Admin navigation">
-          {tabs.map((item) => (
-            <button
-              key={item.key}
-              className={tab === item.key ? "active" : ""}
-              onClick={() => setTab(item.key)}
-            >
-              <Icon name={item.icon} />
-              {item.label}
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-bottom">
-          <a href="#/">
-            <Icon name="arrow" className="back-arrow" />
-            View website
-          </a>
-          <button
-            onClick={async () => {
-              try {
-                await onSignOut()
-                window.location.hash = "#/login"
-              } catch {
-                setSignOutError("Could not sign out. Please try again.")
-              }
-            }}
-          >
-            <Icon name="logout" />
-            Sign out
-          </button>
-          <small>ADMIN PREVIEW</small>
-        </div>
-      </aside>
-      <main className="admin-main">
-        <header className="admin-header">
-          <div>
-            <span className="eyebrow">AL MAIDA PIZZA GARDEN</span>
-            <h1>{title}</h1>
-          </div>
-          <div className="admin-avatar">
-            {(user.displayName?.[0] ?? user.email?.[0] ?? "A").toUpperCase()}
-            <span>{user.email}</span>
-          </div>
-        </header>
-        <div className="admin-demo-banner" role="status">
-          <Icon name="check" />
-          <span>
-            Orders, menu items, customer details and public website details are
-            managed here and saved to Firebase.
-          </span>
-        </div>
-        {(adminError || signOutError) && (
-          <p className="form-error" role="alert">
-            {adminError || signOutError}
-          </p>
-        )}
-        {adminNotice && (
-          <div className="success-note" role="status">
-            <Icon name="check" />
-            {adminNotice}
-          </div>
-        )}
-        {tab === "overview" && (
-          <>
-            <div className="admin-welcome">
-              <span className="eyebrow">YOUR RESTAURANT AT A GLANCE</span>
-              <h2>Welcome to your workspace.</h2>
-              <p>
-                Manage the menu and keep your restaurant details up to date.
-              </p>
-            </div>
-            <div className="stats-grid">
-              <AdminStat label="Menu items" value={menu.length.toString()} />
-              <AdminStat
-                label="Categories"
-                value={categories.length.toString()}
-              />
-              <AdminStat
-                label="Orders today"
-                value={todaysOrders.toString()}
-                note="From latest 1,000"
-              />
-              <AdminStat
-                label="Recent customers"
-                value={recentCustomers.size.toString()}
-                note="From latest 1,000 orders"
-              />
-            </div>
-            <section className="admin-panel revenue-panel">
-              <div className="panel-title">
-                <div>
-                  <span className="eyebrow">REVENUE PERFORMANCE</span>
-                  <h2>{MONEY(paidRevenue)}</h2>
-                  <p>
-                    Confirmed, preparing and completed orders ·{" "}
-                    {period === "day"
-                      ? "Today"
-                      : period === "week"
-                        ? "This week"
-                        : "This month"}
-                  </p>
-                </div>
-                <div className="revenue-periods" aria-label="Analytics period">
-                  {(["day", "week", "month"] as const).map((value) => (
-                    <button
-                      key={value}
-                      className={period === value ? "selected" : ""}
-                      aria-pressed={period === value}
-                      onClick={() => setPeriod(value)}
-                    >
-                      {value[0].toUpperCase() + value.slice(1)}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              {ordersLoading ? (
-                <p className="admin-empty-result" role="status">
-                  Loading revenue data…
-                </p>
-              ) : (
-                <div
-                  className={`revenue-chart ${
-                    period === "day"
-                      ? "revenue-chart-day"
-                      : period === "month"
-                        ? "revenue-chart-month"
-                        : ""
-                  }`}
-                  style={{
-                    gridTemplateColumns: `repeat(${bucketCount}, minmax(0, 1fr))`,
-                  }}
-                  aria-label={`Revenue ${period} chart`}
-                >
-                  {revenueBuckets.map((bucket, index) => (
-                    <div
-                      className="revenue-column"
-                      key={`${bucket.label}-${index}`}
-                      title={`${bucket.label}: ${MONEY(bucket.value)}`}
-                    >
-                      <strong className="revenue-value">
-                        {MONEY(bucket.value)}
-                      </strong>
-                      <div className="revenue-bar-track">
-                        <div
-                          className="revenue-bar"
-                          style={{
-                            height: `${Math.max(
-                              bucket.value ? 3 : 0,
-                              (bucket.value / maximumRevenue) * 100,
-                            )}%`,
-                          }}
-                        />
-                      </div>
-                      <span className="revenue-label">
-                        {period === "month" && index % 3 !== 0
-                          ? ""
-                          : bucket.label}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <p className="analytics-note">
-                Revenue uses saved order starting-price subtotals. Data is
-                limited to the latest 1,000 orders currently loaded.
-              </p>
-              <div className="demand-list">
-                <div className="demand-heading">
-                  <div>
-                    <span className="eyebrow">CUSTOMER DEMAND</span>
-                    <h3>Best-selling items</h3>
-                  </div>
-                  <small>Units · same period</small>
-                </div>
-                {bestSellingItems.length ? (
-                  bestSellingItems.map(([name, count], index) => (
-                    <div className="demand-row" key={name}>
-                      <span className="demand-rank">
-                        {String(index + 1).padStart(2, "0")}
-                      </span>
-                      <span>{name}</span>
-                      <strong>{count} sold</strong>
-                    </div>
-                  ))
-                ) : (
-                  <p className="admin-empty-result">
-                    No confirmed, preparing or completed orders in this period.
-                  </p>
-                )}
-              </div>
-            </section>
-            <div className="admin-overview-grid">
-              <section className="admin-panel">
-                <span className="eyebrow">MENU SNAPSHOT</span>
-                <h2>Popular with guests</h2>
-                <p>Featured dishes from your current menu.</p>
-                <div className="admin-featured-list">
-                  {menu
-                    .filter((item) => item.badge === "Popular")
-                    .slice(0, 4)
-                    .map((item) => (
-                      <div className="admin-featured-item" key={item.id}>
-                        <FoodImage item={item} />
-                        <span>{item.name}</span>
-                        <strong>{MONEY(item.price)}</strong>
-                      </div>
-                    ))}
-                </div>
-                <button className="text-link" onClick={() => setTab("menu")}>
-                  Manage menu <Icon name="arrow" />
-                </button>
-              </section>
-              <section className="admin-panel admin-connection-panel">
-                <span className="eyebrow">ORDER STATUS · THIS PERIOD</span>
-                <h2>Customer order status</h2>
-                <div className="status-chart">
-                  {orderStatusCounts.map(({ status, count }) => (
-                    <div className="status-chart-row" key={status}>
-                      <span>{status}</span>
-                      <div className="status-track">
-                        <i
-                          className={`status-fill status-${status}`}
-                          style={{
-                            width: `${
-                              periodOrders.length
-                                ? (count / periodOrders.length) * 100
-                                : 0
-                            }%`,
-                          }}
-                        />
-                      </div>
-                      <strong>{count}</strong>
-                    </div>
-                  ))}
-                </div>
-                <button
-                  className="button button-outline"
-                  onClick={() => setTab("orders")}
-                >
-                  Open orders <Icon name="arrow" />
-                </button>
-              </section>
-            </div>
-          </>
-        )}
-        {tab === "menu" && (
-          <section className="admin-panel admin-menu-panel">
-            <div className="panel-title">
-              <div>
-                <span className="eyebrow">PRODUCT CATALOG</span>
-                <h2>Menu management</h2>
-                <p>
-                  {filteredMenu.length} of {menu.length} menu items
-                </p>
-              </div>
-              <div className="panel-actions">
-                <label className="search-field">
-                  <Icon name="search" />
-                  <input
-                    type="search"
-                    placeholder="Search dishes or categories"
-                    value={query}
-                    onChange={(event) => setQuery(event.currentTarget.value)}
-                    aria-label="Search menu items"
-                  />
-                </label>
-                <button
-                  className="button button-primary"
-                  onClick={() => {
-                    setEditingMenu(null)
-                    setMenuModal(true)
-                  }}
-                >
-                  <Icon name="plus" /> Add item
-                </button>
-              </div>
-            </div>
-            <div className="table-scroll">
-              <table className="admin-table">
-                <thead>
-                  <tr>
-                    <th>Dish</th>
-                    <th>Category</th>
-                    <th>Price</th>
-                    <th>Availability</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredMenu.map((item) => (
-                    <tr key={item.id}>
-                      <td>
-                        <div className="table-dish">
-                          <FoodImage item={item} />
-                          <strong>{item.name}</strong>
-                        </div>
-                      </td>
-                      <td>{item.category}</td>
-                      <td>
-                        {item.priceFrom ? "From " : ""}
-                        {MONEY(item.price)}
-                      </td>
-                      <td>
-                        <span
-                          className={`availability ${
-                            item.available === false ? "" : "available"
-                          }`}
-                        >
-                          <span />
-                          {item.available === false
-                            ? "Unavailable"
-                            : "Available"}
-                        </span>
-                      </td>
-                      <td>
-                        <div className="table-actions">
-                          <button
-                            className="icon-button"
-                            aria-label={`Edit ${item.name}`}
-                            onClick={() => {
-                              setEditingMenu(item)
-                              setMenuModal(true)
-                            }}
-                          >
-                            <Icon name="edit" />
-                          </button>
-                          <button
-                            className="icon-button danger-action"
-                            aria-label={`Remove ${item.name}`}
-                            onClick={() => void removeMenuItem(item)}
-                          >
-                            <Icon name="close" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-              {filteredMenu.length === 0 && (
-                <p className="admin-empty-result">
-                  No menu items match “{query}”.
-                </p>
-              )}
-            </div>
-          </section>
-        )}
-        {tab === "orders" && (
-          <section className="admin-panel admin-orders-panel">
-            <div className="panel-title">
-              <div>
-                <span className="eyebrow">ORDER MANAGEMENT</span>
-                <h2>Live customer orders</h2>
-                <p>Showing the latest {orders.length} orders (up to 1,000).</p>
-              </div>
-            </div>
-            {ordersError && (
-              <p className="form-error" role="alert">
-                {ordersError}
-              </p>
-            )}
-            {ordersLoading ? (
-              <p className="admin-empty-result" role="status">
-                Loading live orders…
-              </p>
-            ) : orders.length === 0 ? (
-              <div className="admin-empty-result">
-                {ordersError ||
-                  "No orders yet. Customer checkout orders will appear here."}
-              </div>
-            ) : (
-              <div className="admin-order-list">
-                {orders.map((order) => (
-                  <article className="admin-order-card" key={order.id}>
-                    <div className="admin-order-header">
-                      <div>
-                        <span className="eyebrow">
-                          ORDER #{order.id.slice(-6).toUpperCase()}
-                        </span>
-                        <p>{orderDate(order)}</p>
-                      </div>
-                      <label className="order-status-control">
-                        <span className="sr-only">Order status</span>
-                        <select
-                          value={order.status}
-                          disabled={updatingOrderId === order.id}
-                          onChange={(event) =>
-                            void updateOrderStatus(
-                              order.id,
-                              event.currentTarget.value as OrderStatus,
-                            )
-                          }
-                        >
-                          {ORDER_STATUSES.map((status) => (
-                            <option key={status} value={status}>
-                              {status[0].toUpperCase() + status.slice(1)}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </div>
-                    <div className="admin-order-content">
-                      <div>
-                        <h3>{order.customer.name}</h3>
-                        <a href={`tel:${order.customer.phone}`}>
-                          {order.customer.phone}
-                        </a>
-                        <p>{order.customer.address}</p>
-                        {order.customer.notes && (
-                          <p className="admin-order-notes">
-                            Notes: {order.customer.notes}
-                          </p>
-                        )}
-                      </div>
-                      <ul>
-                        {order.items.map((item, index) => (
-                          <li key={`${item.id}-${index}`}>
-                            <span>
-                              {item.name} × {item.qty}
-                            </span>
-                            <strong>
-                              {item.priceFrom ? "From " : ""}
-                              {MONEY(item.price * item.qty)}
-                            </strong>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div className="admin-order-total">
-                      <span>Starting-price subtotal</span>
-                      <strong>{MONEY(order.subtotal)}</strong>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
-        {tab === "customers" && (
-          <>
-            <section className="admin-panel">
-              <div className="panel-title">
-                <div>
-                  <span className="eyebrow">CUSTOMER DIRECTORY</span>
-                  <h2>Customers & order history</h2>
-                  <p>
-                    {customers.length} customers across the latest{" "}
-                    {orders.length} orders loaded.
-                  </p>
-                </div>
-              </div>
-              <div className="status-chart customer-status-chart">
-                <div className="customer-status-heading">
-                  <h3>Order status overview · selected period</h3>
-                  <div
-                    className="revenue-periods"
-                    aria-label="Customer status period"
-                  >
-                    {(["day", "week", "month"] as const).map((value) => (
-                      <button
-                        key={value}
-                        className={period === value ? "selected" : ""}
-                        aria-pressed={period === value}
-                        onClick={() => setPeriod(value)}
-                      >
-                        {value[0].toUpperCase() + value.slice(1)}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                {orderStatusCounts.map(({ status, count }) => (
-                  <div className="status-chart-row" key={status}>
-                    <span>{status}</span>
-                    <div className="status-track">
-                      <i
-                        className={`status-fill status-${status}`}
-                        style={{
-                          width: `${
-                            periodOrders.length
-                              ? (count / periodOrders.length) * 100
-                              : 0
-                          }%`,
-                        }}
-                      />
-                    </div>
-                    <strong>{count}</strong>
-                  </div>
-                ))}
-              </div>
-              {ordersLoading ? (
-                <p className="admin-empty-result" role="status">
-                  Loading customer records…
-                </p>
-              ) : customers.length ? (
-                <div className="customer-list">
-                  {customers.map((customer) => (
-                    <article
-                      className="customer-card"
-                      key={customer.phone.replace(/\D/g, "")}
-                    >
-                      <div className="customer-card-header">
-                        <div>
-                          <h3>{customer.name}</h3>
-                          <a href={`tel:${customer.phone}`}>{customer.phone}</a>
-                          <p>{customer.address}</p>
-                        </div>
-                        <button
-                          className="button button-outline"
-                          onClick={() =>
-                            setEditingCustomer({
-                              customerKey: customer.phone.replace(/\D/g, ""),
-                              phone: customer.phone,
-                              name: customer.name,
-                              address: customer.address,
-                              notes: customer.notes,
-                            })
-                          }
-                        >
-                          <Icon name="edit" /> Edit customer
-                        </button>
-                      </div>
-                      <p className="customer-order-count">
-                        {customer.orders.length} order
-                        {customer.orders.length === 1 ? "" : "s"} · Last order{" "}
-                        {orderDate(customer.orders[0])}
-                      </p>
-                      <div className="customer-order-history">
-                        {customer.orders.slice(0, 5).map((order) => (
-                          <div className="customer-order-row" key={order.id}>
-                            <div>
-                              <strong>
-                                #{order.id.slice(-6).toUpperCase()}
-                              </strong>
-                              <span>{orderDate(order)}</span>
-                            </div>
-                            <span
-                              className={`order-status-pill status-${order.status}`}
-                            >
-                              {order.status}
-                            </span>
-                            <span>
-                              {order.items
-                                .map((item) => `${item.name} × ${item.qty}`)
-                                .join(", ")}
-                            </span>
-                            <strong>{MONEY(order.subtotal)}</strong>
-                          </div>
-                        ))}
-                        {customer.orders.length > 5 && (
-                          <p className="analytics-note">
-                            Showing 5 of {customer.orders.length} loaded orders
-                            for this customer.
-                          </p>
-                        )}
-                      </div>
-                    </article>
-                  ))}
-                </div>
-              ) : (
-                <p className="admin-empty-result">
-                  No customer records yet. Customers appear after their first
-                  order.
-                </p>
-              )}
-              <p className="analytics-note">
-                Customer history is grouped by phone number and limited to the
-                latest 1,000 orders loaded.
-              </p>
-            </section>
-          </>
-        )}
-        {tab === "settings" && (
-          <section className="admin-panel settings-panel">
-            <span className="eyebrow">BUSINESS PROFILE</span>
-            <h2>Website details</h2>
-            <p>
-              Changes are saved to Firebase and reflected on the public site.
-            </p>
-            <form
-              key={JSON.stringify(contactInfo)}
-              className="form-stack admin-settings-form"
-              onSubmit={(event) => void saveRestaurantSettings(event)}
-            >
-              <label>
-                Restaurant name
-                <input
-                  name="name"
-                  defaultValue={contactInfo.name}
-                  required
-                  maxLength={100}
-                />
-              </label>
-              <label>
-                Phone number
-                <input
-                  name="phone"
-                  defaultValue={contactInfo.phone}
-                  required
-                  maxLength={30}
-                />
-              </label>
-              <label>
-                Address
-                <input
-                  name="address"
-                  defaultValue={contactInfo.address}
-                  required
-                  maxLength={300}
-                />
-              </label>
-              <label>
-                Opening hours
-                <input
-                  name="hours"
-                  defaultValue={contactInfo.hours}
-                  required
-                  maxLength={150}
-                />
-              </label>
-              <label>
-                Homepage headline
-                <input
-                  name="heroTitle"
-                  defaultValue={contactInfo.heroTitle}
-                  required
-                  maxLength={150}
-                />
-              </label>
-              <label>
-                Homepage introduction
-                <textarea
-                  name="heroDescription"
-                  defaultValue={contactInfo.heroDescription}
-                  required
-                  maxLength={500}
-                  rows={3}
-                />
-              </label>
-              <button
-                className="button button-primary"
-                type="submit"
-                disabled={settingsSaving}
-              >
-                {settingsSaving ? "Saving…" : "Save website details"}
-              </button>
-            </form>
-            <p className="form-help">
-              Restaurant name, phone, address, hours, and homepage copy appear
-              on the public website.
-            </p>
-          </section>
-        )}
-        {menuModal && (
-          <Dialog
-            title={editingMenu ? "Edit menu item" : "Add menu item"}
-            close={() => setMenuModal(false)}
-          >
-            <form
-              className="form-stack"
-              onSubmit={(event) => void saveMenuItem(event)}
-            >
-              <label>
-                Item name
-                <input
-                  name="name"
-                  defaultValue={editingMenu?.name ?? ""}
-                  required
-                  maxLength={100}
-                />
-              </label>
-              <label>
-                Urdu name
-                <input
-                  name="urdu"
-                  defaultValue={editingMenu?.urdu ?? ""}
-                  maxLength={100}
-                />
-              </label>
-              <label>
-                Description
-                <textarea
-                  name="description"
-                  defaultValue={editingMenu?.description ?? ""}
-                  maxLength={400}
-                  rows={3}
-                />
-              </label>
-              <div className="form-row">
-                <label>
-                  Price (Rs.)
-                  <input
-                    name="price"
-                    type="number"
-                    min="1"
-                    step="1"
-                    defaultValue={editingMenu?.price ?? ""}
-                    required
-                  />
-                </label>
-                <label>
-                  Category
-                  <input
-                    name="category"
-                    list="menu-categories"
-                    defaultValue={editingMenu?.category ?? ""}
-                    required
-                    maxLength={60}
-                  />
-                  <datalist id="menu-categories">
-                    {categories.map((value) => (
-                      <option key={value} value={value} />
-                    ))}
-                  </datalist>
-                </label>
-              </div>
-              <label>
-                Image URL
-                <input
-                  name="image"
-                  type="url"
-                  defaultValue={editingMenu?.image ?? ""}
-                  placeholder="https://example.com/dish.jpg"
-                  maxLength={1000}
-                />
-              </label>
-              <label>
-                Badge <span className="optional">(optional)</span>
-                <input
-                  name="badge"
-                  defaultValue={editingMenu?.badge ?? ""}
-                  placeholder="Popular, New, Chef's pick..."
-                  maxLength={40}
-                />
-              </label>
-              <div className="check-row">
-                <label>
-                  <input
-                    type="checkbox"
-                    name="priceFrom"
-                    defaultChecked={editingMenu?.priceFrom ?? false}
-                  />
-                  Price starts from this amount
-                </label>
-                <label>
-                  <input
-                    type="checkbox"
-                    name="available"
-                    defaultChecked={editingMenu?.available !== false}
-                  />
-                  Available to order
-                </label>
-              </div>
-              <button
-                className="button button-primary"
-                type="submit"
-                disabled={menuSaving}
-              >
-                {menuSaving ? "Saving item…" : "Save and publish item"}
-              </button>
-            </form>
-          </Dialog>
-        )}
-        {editingCustomer && (
-          <Dialog
-            title="Edit customer details"
-            close={() => setEditingCustomer(null)}
-          >
-            <form
-              className="form-stack"
-              onSubmit={(event) => void saveCustomer(event)}
-            >
-              <label>
-                Customer name
-                <input
-                  name="name"
-                  defaultValue={editingCustomer.name}
-                  required
-                  maxLength={100}
-                />
-              </label>
-              <label>
-                Phone number
-                <input
-                  name="phone"
-                  type="tel"
-                  defaultValue={editingCustomer.phone}
-                  required
-                  maxLength={20}
-                />
-              </label>
-              <label>
-                Delivery address
-                <textarea
-                  name="address"
-                  defaultValue={editingCustomer.address}
-                  required
-                  maxLength={400}
-                  rows={3}
-                />
-              </label>
-              <label>
-                Customer notes
-                <textarea
-                  name="notes"
-                  defaultValue={editingCustomer.notes}
-                  maxLength={300}
-                  rows={2}
-                />
-              </label>
-              <p className="form-help">
-                Updated details will apply to all of this customer's loaded
-                orders.
-              </p>
-              <button
-                className="button button-primary"
-                type="submit"
-                disabled={customerSaving}
-              >
-                {customerSaving ? "Saving details…" : "Save customer details"}
-              </button>
-            </form>
-          </Dialog>
-        )}
-        <footer className="admin-footer">
-          {contactInfo.name} · Admin workspace
-        </footer>
-      </main>
-    </div>
-  )
-}
-
-function AdminStat({
-  label,
-  value,
-  note,
-}: {
-  label: string
-  value: string
-  note?: string
-}) {
-  return (
-    <div className="stat">
-      <div>
-        <span>{label}</span>
-        <strong>{value}</strong>
-        {note && <small>{note}</small>}
-      </div>
-      <Icon name={label === "Menu items" ? "utensils" : "grid"} />
-    </div>
-  )
-}
-
-function LoginPage({
-  onSignIn,
-  restaurantName,
-}: {
-  onSignIn: (email: string, password: string) => Promise<unknown>
-  restaurantName: string
-}) {
-  const [error, setError] = useState("")
-  const [loading, setLoading] = useState(false)
-  return (
-    <div className="login-page">
-      <div className="login-art">
-        <Brand light name={restaurantName} />
-        <div>
-          <span className="eyebrow">THE HEART BEHIND THE HOSPITALITY</span>
-          <h1>
-            Great food.
-            <br />
-            <em>Thoughtfully managed.</em>
-          </h1>
-          <p>
-            Your workspace for the menu
-            <br />
-            and the details that make us special.
-          </p>
-        </div>
-        <Flower className="login-flower" />
-        <span className="login-art-footer">
-          {restaurantName.toUpperCase()} · DERA GHAZI KHAN
-        </span>
-      </div>
-      <div className="login-content">
-        <a href="#/" className="text-link">
-          <Icon name="arrow" className="back-arrow" />
-          Back to the website
-        </a>
-        <div className="login-form-wrap">
-          <span className="eyebrow">ADMIN WORKSPACE</span>
-          <h2>Welcome back.</h2>
-          <p>Sign in with your Firebase email and password.</p>
-          <form
-            className="form-stack"
-            onSubmit={async (event) => {
-              event.preventDefault()
-              if (loading) return
-              setLoading(true)
-              setError("")
-              const data = new FormData(event.currentTarget)
-              try {
-                await onSignIn(
-                  String(data.get("email")).trim(),
-                  String(data.get("password")),
-                )
-                window.location.hash = "#/admin"
-              } catch (loginError) {
-                const code =
-                  loginError instanceof FirebaseError ? loginError.code : ""
-                if (
-                  code === "auth/invalid-credential" ||
-                  code === "auth/user-not-found" ||
-                  code === "auth/wrong-password"
-                ) {
-                  setError("Email or password is incorrect.")
-                } else if (code === "auth/invalid-email") {
-                  setError("Enter a valid email address.")
-                } else if (code === "auth/too-many-requests") {
-                  setError("Too many attempts. Wait a moment and try again.")
-                } else if (code === "auth/operation-not-allowed") {
-                  setError(
-                    "Email/password sign-in is disabled. Enable it in Firebase Authentication.",
-                  )
-                } else if (code === "auth/network-request-failed") {
-                  setError("Network error. Check your connection and retry.")
-                } else {
-                  setError("Sign-in failed. Please try again.")
-                }
-              } finally {
-                setLoading(false)
-              }
-            }}
-          >
-            <label>
-              Email address
-              <input
-                type="email"
-                name="email"
-                autoComplete="username"
-                required
-                placeholder="admin@example.com"
-              />
-            </label>
-            <label>
-              Password
-              <input
-                type="password"
-                name="password"
-                autoComplete="current-password"
-                required
-                placeholder="Enter your password"
-              />
-            </label>
-            {error && (
-              <p className="form-error" role="alert">
-                {error}
-              </p>
-            )}
-            <button
-              className="button button-primary"
-              type="submit"
-              disabled={loading}
-            >
-              {loading ? "Signing in..." : "Sign in"}
-              {!loading && <Icon name="arrow" />}
-            </button>
-          </form>
-          <div className="demo-note">
-            <Icon name="lock" />
-            <div>
-              <strong>Secure administrator sign-in</strong>
-              <p>
-                Use the administrator account created in Firebase
-                Authentication. Public sign-up is not available.
-              </p>
-              <small>
-                Ensure Firebase Authentication Email/Password is enabled and
-                sign in with {ADMIN_EMAIL}.
-              </small>
-            </div>
-          </div>
-        </div>
-        <small className="login-copyright">
-          Al Maida Pizza Garden · Made with care.
-        </small>
-      </div>
-    </div>
-  )
-}
-
-function AuthLoading() {
-  return (
-    <main className="auth-loading" role="status">
-      <span className="eyebrow">AL MAIDA PIZZA GARDEN</span>
-      <p>Checking your sign-in…</p>
-    </main>
   )
 }
 
 function Checkout({
   cart,
   total,
-  onComplete,
+  openWhatsApp,
+  onHandoff,
 }: {
   cart: CartItem[]
   total: number
-  onComplete: () => void
+  openWhatsApp: (message: string) => void
+  onHandoff: (customer: {
+    name: string
+    address: string
+    phone: string
+    notes: string
+  }) => Promise<void>
 }) {
   const [error, setError] = useState("")
-  const [submitting, setSubmitting] = useState(false)
-  const [orderReference, setOrderReference] = useState("")
-  const [whatsAppLink, setWhatsAppLink] = useState("")
-  const [customerName, setCustomerName] = useState("")
   const submit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     const data = new FormData(e.currentTarget)
@@ -2842,69 +1474,23 @@ function Checkout({
       !name ||
       !address ||
       !/^[+\d\s()-]{10,20}$/.test(phone) ||
-      phone.replace(/\D/g, "").length < 10 ||
-      cart.length === 0
+      phone.replace(/\D/g, "").length < 10
     ) {
       setError(
-        cart.length === 0
-          ? "Your cart is empty. Add an item before placing an order."
-          : "Please enter your name, delivery address and a valid contact number.",
+        "Please enter your name, delivery address and a valid contact number.",
       )
       return
     }
-    setError("")
-    setSubmitting(true)
-    setCustomerName(name)
+    openWhatsApp(
+      `Hello Lalazar Cafe! I would like to place an order.\n\n${cart.map((item) => `${item.name} × ${item.qty} — ${MONEY(item.price * item.qty)}`).join("\n")}\n\nSubtotal: ${MONEY(total)}\nFull name: ${name}\nDelivery address: ${address}\nContact number: ${phone}\nNotes: ${notes || "None"}\n\nPlease confirm availability, delivery charges and total.`,
+    )
     try {
-      const order = await addDoc(collection(db, "orders"), {
-        customer: { name, address, phone, notes },
-        items: cart.map((item) => ({
-          id: item.id,
-          name: item.name,
-          qty: item.qty,
-          price: item.price,
-          priceFrom: Boolean(item.priceFrom),
-        })),
-        subtotal: total,
-        status: "pending",
-        createdAt: serverTimestamp(),
-      })
-      const message = `Hello Al Maida Pizza Garden! I would like to place an order.\n\nOrder reference: ${order.id}\n\n${cart.map((item) => `${item.name} × ${item.qty} — ${item.priceFrom ? "from " : ""}${MONEY(item.price * item.qty)}`).join("\n")}\n\nStarting-price subtotal: ${MONEY(total)}\nFull name: ${name}\nDelivery address: ${address}\nContact number: ${phone}\nNotes: ${notes || "None"}\n\nPlease confirm availability, serving options, delivery charges and final total.`
-      setWhatsAppLink(
-        `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(message)}`,
-      )
-      setOrderReference(order.id)
-    } catch (cause) {
-      setError(
-        cause instanceof FirebaseError
-          ? `We couldn't save your order (${cause.code}). Please try again or contact us on WhatsApp.`
-          : "We couldn't save your order. Please try again or contact us on WhatsApp.",
-      )
-    } finally {
-      setSubmitting(false)
+      await onHandoff({ name, address, phone, notes })
+    } catch (handoffError) {
+      setError(`We could not save your order. ${getErrorMessage(handoffError)}`)
     }
   }
-  return orderReference ? (
-    <div className="checkout-success" role="status">
-      <span className="eyebrow">ORDER SAVED</span>
-      <h3>Thanks, {customerName}.</h3>
-      <p>
-        Your order <strong>#{orderReference.slice(-6).toUpperCase()}</strong> is
-        saved as pending. Continue to WhatsApp to send it to our team for
-        confirmation.
-      </p>
-      <a
-        className="button button-primary"
-        href={whatsAppLink}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={onComplete}
-      >
-        <Icon name="message" />
-        Continue to WhatsApp <Icon name="arrow" />
-      </a>
-    </div>
-  ) : (
+  return (
     <form className="form-stack" onSubmit={submit}>
       <div className="checkout-summary">
         {cart.map((item) => (
@@ -2912,14 +1498,11 @@ function Checkout({
             <span>
               {item.name} × {item.qty}
             </span>
-            <span>
-              {item.priceFrom ? "From " : ""}
-              {MONEY(item.price * item.qty)}
-            </span>
+            <span>{MONEY(item.price * item.qty)}</span>
           </div>
         ))}
         <div className="checkout-total">
-          <strong>Starting-price subtotal</strong>
+          <strong>Subtotal</strong>
           <strong>{MONEY(total)}</strong>
         </div>
       </div>
@@ -2968,18 +1551,13 @@ function Checkout({
           {error}
         </p>
       )}
-      <button
-        className="button button-primary"
-        type="submit"
-        disabled={submitting}
-      >
+      <button className="button button-primary" type="submit">
         <Icon name="message" />
-        {submitting ? "Saving your order…" : "Place order & continue"}
-        {!submitting && <Icon name="arrow" />}
+        Send order on WhatsApp <Icon name="arrow" />
       </button>
       <p className="form-help">
-        Your order is saved securely before WhatsApp opens. Our team will
-        confirm availability, delivery charges and the final total.
+        Your order details are saved securely for cafe staff and included in
+        WhatsApp. Send the message so our team can confirm it.
       </p>
     </form>
   )
@@ -3017,7 +1595,7 @@ function Reservation({
           return
         }
         openWhatsApp(
-          `Hello Al Maida Pizza Garden! I would like to request a table.\n\nName: ${name}\nContact: ${phone}\nDate: ${date}\nTime: ${data.get("time")}\nGuests: ${data.get("guests")}\n\nPlease confirm availability. Thank you!`,
+          `Hello Lalazar Cafe! I would like to request a table.\n\nName: ${name}\nContact: ${phone}\nDate: ${date}\nTime: ${data.get("time")}\nGuests: ${data.get("guests")}\n\nPlease confirm availability. Thank you!`,
         )
         complete()
       }}
@@ -3080,5 +1658,1041 @@ function Reservation({
         confirm your table on WhatsApp.
       </p>
     </form>
+  )
+}
+
+function Admin({
+  menu,
+  saveMenu,
+  customers,
+  orders,
+  contactInfo,
+  saveCustomers,
+  saveOrders,
+  saveContactInfo,
+  authenticated,
+  authReady,
+  login,
+  logout,
+}: {
+  menu: MenuItem[]
+  saveMenu: (menu: MenuItem[]) => Promise<boolean>
+  customers: CustomerRecord[]
+  orders: CustomerOrderRecord[]
+  contactInfo: ContactInfo
+  saveCustomers: (customers: CustomerRecord[]) => Promise<boolean>
+  saveOrders: (orders: CustomerOrderRecord[]) => Promise<boolean>
+  saveContactInfo: (contactInfo: ContactInfo) => Promise<boolean>
+  authenticated: boolean
+  authReady: boolean
+  login: (email: string, password: string) => Promise<void>
+  logout: () => Promise<void>
+}) {
+  const [tab, setTab] = useState<
+    "overview" | "menu" | "orders" | "customers" | "settings"
+  >("overview")
+  const [error, setError] = useState("")
+  const [authLoading, setAuthLoading] = useState(false)
+  const [feedback, setFeedback] = useState("")
+  const [query, setQuery] = useState("")
+  const [edit, setEdit] = useState<MenuItem | null>(null)
+  const [isNewDish, setIsNewDish] = useState(false)
+  const [customerForm, setCustomerForm] = useState<CustomerRecord>({
+    id: "",
+    name: "",
+    phone: "",
+    email: "",
+    address: "",
+    notes: "",
+    createdAt: new Date().toISOString(),
+  })
+  const [customerQuery, setCustomerQuery] = useState("")
+  const restorePreviousMenuItems = async () => {
+    const existingNames = new Set(
+      menu.map((item) => item.name.trim().toLowerCase()),
+    )
+    const missingItems = MENU.filter(
+      (item) => !existingNames.has(item.name.trim().toLowerCase()),
+    )
+    if (missingItems.length === 0) {
+      setFeedback("All earlier menu items are already listed.")
+      return
+    }
+
+    const firstAvailableId =
+      menu.reduce((maxId, item) => Math.max(maxId, item.id), 0) + 1
+    const restoredItems = missingItems.map((item, index) => ({
+      ...item,
+      id: firstAvailableId + index,
+    }))
+    if (await saveMenu([...menu, ...restoredItems])) {
+      setFeedback(
+        `Restored ${restoredItems.length} earlier menu item${restoredItems.length === 1 ? "" : "s"} alongside the current menu.`,
+      )
+    }
+  }
+  const closeEdit = useRef(() => {
+    setEdit(null)
+    setIsNewDish(false)
+    setError("")
+  }).current
+  const tabs = [
+    { key: "overview" as const, label: "Overview", icon: "grid" as const },
+    {
+      key: "menu" as const,
+      label: "Menu management",
+      icon: "utensils" as const,
+    },
+    { key: "orders" as const, label: "Orders", icon: "bag" as const },
+    {
+      key: "customers" as const,
+      label: "Customers",
+      icon: "check" as const,
+    },
+    {
+      key: "settings" as const,
+      label: "Cafe settings",
+      icon: "settings" as const,
+    },
+  ]
+
+  const revenueToday = getRevenueBuckets(orders, "day").reduce(
+    (total, bucket) => total + bucket.amount,
+    0,
+  )
+  const revenueThisWeek = getRevenueBuckets(orders, "week").reduce(
+    (total, bucket) => total + bucket.amount,
+    0,
+  )
+  const revenueThisMonth = getRevenueBuckets(orders, "month").reduce(
+    (total, bucket) => total + bucket.amount,
+    0,
+  )
+  const uniqueCustomers = countUniqueCustomers(orders)
+  const repeatCustomers = countRepeatCustomers(orders)
+  const topItem = Object.entries(
+    orders
+      .filter((order) => order.status !== "Cancelled")
+      .reduce<Record<string, number>>((all, order) => {
+      order.items.forEach((item) => {
+        all[item.name] = (all[item.name] ?? 0) + item.qty
+      })
+      return all
+      }, {}),
+  ).sort((a, b) => b[1] - a[1])[0]
+
+  if (!authenticated)
+    return (
+      <div className="login-page">
+        <div className="login-art">
+          <Brand light />
+          <div>
+            <span className="eyebrow">THE HEART BEHIND THE HOSPITALITY</span>
+            <h1>
+              A little care.
+              <br />
+              <em>A lot of Lalazar.</em>
+            </h1>
+            <p>
+              Your space to look after the menu
+              <br />
+              and the moments that make us special.
+            </p>
+          </div>
+          <Flower className="login-flower" />
+          <span className="login-art-footer">
+            BALOCHI FLAVOURS. HEARTFELT HOSPITALITY.
+          </span>
+        </div>
+        <div className="login-content">
+          <a href="#/" className="text-link">
+            <Icon name="arrow" className="back-arrow" />
+            Back to the cafe
+          </a>
+          <div className="login-form-wrap">
+            <span className="eyebrow">LALAZAR ADMIN</span>
+            <h2>Welcome back.</h2>
+            <p>Sign in to your cafe dashboard.</p>
+            <form
+              className="form-stack"
+              onSubmit={async (e) => {
+                e.preventDefault()
+                if (authLoading) return
+                setAuthLoading(true)
+                const data = new FormData(e.currentTarget)
+                try {
+                  await login(
+                    String(data.get("email")),
+                    String(data.get("password")),
+                  )
+                  setError("")
+                } catch (loginError) {
+                  setError(getAuthErrorMessage(loginError))
+                } finally {
+                  setAuthLoading(false)
+                }
+              }}
+            >
+              <label>
+                Email address
+                <input
+                  type="email"
+                  name="email"
+                  autoComplete="username"
+                  required
+                  placeholder={ADMIN_EMAIL}
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  name="password"
+                  autoComplete="current-password"
+                  required
+                  placeholder="Enter your password"
+                />
+              </label>
+              {error && (
+                <p className="form-error" role="alert">
+                  {error}
+                </p>
+              )}
+              <button
+                className="button button-primary"
+                type="submit"
+                disabled={authLoading || !authReady || !firebaseConfigured}
+              >
+                {authLoading ? "Signing in..." : "Sign in"}
+                {!authLoading && <Icon name="arrow" />}
+              </button>
+            </form>
+            <div className="demo-note">
+              <Icon name="lock" />
+              <div>
+                <strong>Firebase administrator sign-in</strong>
+                <p>
+                  Authorized email: <code>{ADMIN_EMAIL}</code>
+                </p>
+                <small>
+                  Use the password for this verified Firebase Authentication
+                  account. Do not create public sign-ups for admin access.
+                </small>
+              </div>
+            </div>
+          </div>
+          <small className="login-copyright">
+            Lalazar Cafe · Made with care.
+          </small>
+        </div>
+      </div>
+    )
+
+  return (
+    <div className="admin-layout">
+      <aside className="admin-sidebar">
+        <Brand light />
+        <span className="eyebrow">CAFE WORKSPACE</span>
+        <nav aria-label="Admin navigation">
+          {tabs.map((item) => (
+            <button
+              key={item.key}
+              className={tab === item.key ? "active" : ""}
+              onClick={() => {
+                setTab(item.key)
+                setFeedback("")
+                setError("")
+              }}
+            >
+              <Icon name={item.icon} />
+              {item.label}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-bottom">
+          <a href="#/">
+            <Icon name="arrow" />
+            View website
+          </a>
+          <button onClick={logout}>
+            <Icon name="logout" />
+            Sign out
+          </button>
+          <small>FIREBASE WORKSPACE</small>
+        </div>
+      </aside>
+      <main className="admin-main">
+        <header className="admin-header">
+          <div>
+            <span className="eyebrow">LALAZAR CAFE</span>
+            <h1>{tabs.find((item) => item.key === tab)?.label}</h1>
+          </div>
+          <div className="admin-avatar">
+            L<span>Cafe administrator</span>
+          </div>
+        </header>
+        <div className="admin-demo-banner">
+          <Icon name="lock" />
+          <span>
+            Connected to Firebase. Menu and cafe settings are public; customer
+            and order records are restricted to the verified administrator.
+          </span>
+        </div>
+        {feedback && (
+          <div className="success-note" role="status">
+            <Icon name="check" />
+            {feedback}
+          </div>
+        )}
+
+        {tab === "overview" && (
+          <>
+            <div className="admin-welcome">
+              <h2>A warm welcome, again.</h2>
+              <p>A quick view of your cafe operations and order performance.</p>
+            </div>
+            <div className="stats-grid">
+              <Stat label="Revenue today" value={MONEY(revenueToday)} icon="bag" />
+              <Stat
+                label="Revenue this week"
+                value={MONEY(revenueThisWeek)}
+                icon="grid"
+              />
+              <Stat
+                label="Revenue this month"
+                value={MONEY(revenueThisMonth)}
+                icon="check"
+              />
+              <Stat
+                label="Most ordered item"
+                value={topItem ? `${topItem[0]} (${topItem[1]})` : "No orders"}
+                icon="utensils"
+              />
+              <Stat
+                label="Unique customers"
+                value={uniqueCustomers.toString()}
+                icon="heart"
+              />
+              <Stat
+                label="Repeat customers"
+                value={repeatCustomers.toString()}
+                icon="check"
+              />
+            </div>
+            <RevenueChart orders={orders} />
+            <p className="analytics-note">
+              Revenue includes confirmed, preparing, out-for-delivery, and
+              delivered orders; pending and cancelled orders are excluded.
+              Customer counts are matched by phone number. Website visits aren’t
+              tracked in this dashboard.
+            </p>
+            <div className="admin-overview-grid">
+              <section className="admin-panel">
+                <span className="eyebrow">MAKE IT YOURS</span>
+                <h2>Keep the menu fresh.</h2>
+                <p>Update dishes, pricing and availability whenever the kitchen changes.</p>
+                <button className="button button-primary" onClick={() => setTab("menu")}>
+                  Manage your menu <Icon name="arrow" />
+                </button>
+              </section>
+              <section className="admin-panel">
+                <span className="eyebrow">STAY CONNECTED</span>
+                <h2>Customer contact details</h2>
+                <p className="whatsapp-value">{contactInfo.phone}</p>
+                <p>{contactInfo.address}</p>
+                <button className="text-link" onClick={() => setTab("settings")}>
+                  Update cafe settings <Icon name="arrow" />
+                </button>
+              </section>
+            </div>
+            <section className="admin-panel">
+              <div className="panel-title">
+                <h2>Recent customer orders</h2>
+                <button className="text-link" onClick={() => setTab("orders")}>
+                  View all <Icon name="arrow" />
+                </button>
+              </div>
+              <OrderTable
+                orders={orders.slice(0, 5)}
+                onStatusChange={async (id, status) => {
+                  const next = orders.map((order) => {
+                    if (order.id !== id) return order
+                    const timeline = ORDER_STATUS_FLOW.map((step) => {
+                      const ahead = ORDER_STATUS_FLOW.indexOf(step) <= ORDER_STATUS_FLOW.indexOf(status)
+                      const existing = order.timeline.find((entry) => entry.status === step)
+                      return {
+                        status: step,
+                        time: existing?.time ?? new Date().toISOString(),
+                        note: ahead ? (step === status ? `Marked as ${status}` : existing?.note ?? "Confirmed") : existing?.note ?? "Waiting",
+                      }
+                    })
+                    return {
+                      ...order,
+                      status,
+                      updatedAt: new Date().toISOString(),
+                      timeline,
+                    }
+                  })
+                  if (await saveOrders(next)) setFeedback("Order status updated.")
+                }}
+              />
+            </section>
+          </>
+        )}
+
+        {tab === "menu" && (
+          <section className="admin-panel">
+            <div className="panel-title">
+              <div>
+                <h2>Your menu, your way.</h2>
+                <p>Add, edit or remove dishes and adjust item availability.</p>
+              </div>
+              <div className="panel-actions">
+                <button
+                  className="button button-outline"
+                  onClick={() => void restorePreviousMenuItems()}
+                >
+                  Restore earlier menu items
+                </button>
+                <button
+                  className="button button-primary"
+                  onClick={() => {
+                    setIsNewDish(true)
+                    setEdit({
+                      id: Date.now(),
+                      name: "",
+                      urdu: "",
+                      description: "",
+                      price: 0,
+                      category: "Sajji & BBQ",
+                      image: "/images/meal.jpg",
+                      available: true,
+                    })
+                  }}
+                >
+                  Add dish <Icon name="plus" />
+                </button>
+                <div className="search-field">
+                  <Icon name="search" />
+                  <input
+                    aria-label="Search menu"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search dishes..."
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="table-scroll">
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    <th>Dish</th>
+                    <th>Category</th>
+                    <th>Price</th>
+                    <th>Availability</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {menu
+                    .filter((item) =>
+                      `${item.name} ${item.urdu} ${item.category}`
+                        .toLowerCase()
+                        .includes(query.toLowerCase()),
+                    )
+                    .map((item) => (
+                      <tr key={item.id}>
+                        <td>
+                          <div className="table-dish">
+                            <FoodImage item={item} />
+                            <div>
+                              <strong>{item.name}</strong>
+                              <small lang="ur" dir="rtl">
+                                {item.urdu}
+                              </small>
+                            </div>
+                          </div>
+                        </td>
+                        <td>{item.category}</td>
+                        <td>{MONEY(item.price)}</td>
+                        <td>
+                          <button
+                            className={`availability ${item.available !== false ? "available" : ""}`}
+                            aria-label={`Toggle availability for ${item.name}`}
+                            aria-pressed={item.available !== false}
+                            onClick={async () => {
+                              if (await saveMenu(
+                                menu.map((value) =>
+                                  value.id === item.id
+                                    ? { ...value, available: value.available === false }
+                                    : value,
+                                ),
+                              ))
+                                setFeedback(`${item.name} availability updated.`)
+                            }}
+                          >
+                            <span />
+                            {item.available !== false ? "Available" : "Unavailable"}
+                          </button>
+                        </td>
+                        <td>
+                          <div className="table-actions">
+                            <button
+                              className="icon-button"
+                              aria-label={`Edit ${item.name}`}
+                              onClick={() => {
+                                setIsNewDish(false)
+                                setEdit({ ...item })
+                              }}
+                            >
+                              <Icon name="edit" />
+                            </button>
+                            <button
+                              className="icon-button danger"
+                              aria-label={`Delete ${item.name}`}
+                              onClick={async () => {
+                                const nextMenu = menu.filter((value) => value.id !== item.id)
+                                if (await saveMenu(nextMenu)) setFeedback(`${item.name} removed from the menu.`)
+                              }}
+                            >
+                              <Icon name="close" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+              {!menu.some((item) =>
+                `${item.name} ${item.urdu} ${item.category}`
+                  .toLowerCase()
+                  .includes(query.toLowerCase()),
+              ) && (
+                <div className="empty-state">
+                  <p>No dishes found. Try another search.</p>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
+        {tab === "orders" && (
+          <section className="admin-panel">
+            <div className="panel-title">
+              <div>
+                <h2>Customer order dashboard</h2>
+                <p>Each order shows its status, deadline and live fulfilment timeline.</p>
+              </div>
+            </div>
+            <OrderTable
+              orders={orders}
+              onStatusChange={async (id, status) => {
+                const next = orders.map((order) => {
+                  if (order.id !== id) return order
+                  const timeline = ORDER_STATUS_FLOW.map((step) => {
+                    const ahead = ORDER_STATUS_FLOW.indexOf(step) <= ORDER_STATUS_FLOW.indexOf(status)
+                    const existing = order.timeline.find((entry) => entry.status === step)
+                    return {
+                      status: step,
+                      time: existing?.time ?? new Date().toISOString(),
+                      note: ahead ? (step === status ? `Marked as ${status}` : existing?.note ?? "Confirmed") : existing?.note ?? "Waiting",
+                    }
+                  })
+                  return {
+                    ...order,
+                    status,
+                    updatedAt: new Date().toISOString(),
+                    timeline,
+                  }
+                })
+                if (await saveOrders(next)) setFeedback("Order status updated.")
+              }}
+            />
+          </section>
+        )}
+
+        {tab === "customers" && (
+          <section className="admin-panel">
+            <div className="panel-title">
+              <div>
+                <h2>Customer directory</h2>
+                <p>Manage customer profile records and keep contacts organised.</p>
+              </div>
+              <div className="search-field">
+                <Icon name="search" />
+                <input
+                  aria-label="Search customers"
+                  value={customerQuery}
+                  onChange={(e) => setCustomerQuery(e.target.value)}
+                  placeholder="Search customers..."
+                />
+              </div>
+            </div>
+            <form
+              className="customer-form form-stack"
+              onSubmit={async (e) => {
+                e.preventDefault()
+                const nextCustomer = {
+                  ...customerForm,
+                  name: customerForm.name.trim(),
+                  phone: customerForm.phone.trim(),
+                  email: customerForm.email.trim(),
+                  address: customerForm.address.trim(),
+                  notes: customerForm.notes.trim(),
+                }
+                if (!nextCustomer.name || !nextCustomer.phone || !nextCustomer.address) {
+                  setError("Name, phone and address are required.")
+                  return
+                }
+                const exists = customers.some((customer) => customer.id === nextCustomer.id)
+                const nextCustomers = exists
+                  ? customers.map((customer) => (customer.id === nextCustomer.id ? nextCustomer : customer))
+                  : [{ ...nextCustomer, id: `CUST-${Date.now().toString().slice(-6)}` }, ...customers]
+                if (await saveCustomers(nextCustomers)) {
+                  setCustomerForm({ id: "", name: "", phone: "", email: "", address: "", notes: "", createdAt: new Date().toISOString() })
+                  setFeedback(exists ? "Customer record saved." : "Customer added.")
+                  setError("")
+                }
+              }}
+            >
+              <div className="form-row">
+                <label>
+                  Name
+                  <input
+                    value={customerForm.name}
+                    onChange={(e) => setCustomerForm((current) => ({ ...current, name: e.target.value }))}
+                    required
+                  />
+                </label>
+                <label>
+                  Phone
+                  <input
+                    value={customerForm.phone}
+                    onChange={(e) => setCustomerForm((current) => ({ ...current, phone: e.target.value }))}
+                    required
+                  />
+                </label>
+              </div>
+              <div className="form-row">
+                <label>
+                  Email
+                  <input
+                    type="email"
+                    value={customerForm.email}
+                    onChange={(e) => setCustomerForm((current) => ({ ...current, email: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Address
+                  <input
+                    value={customerForm.address}
+                    onChange={(e) => setCustomerForm((current) => ({ ...current, address: e.target.value }))}
+                    required
+                  />
+                </label>
+              </div>
+              <label>
+                Notes
+                <textarea
+                  rows={3}
+                  value={customerForm.notes}
+                  onChange={(e) => setCustomerForm((current) => ({ ...current, notes: e.target.value }))}
+                />
+              </label>
+              {error && <p className="form-error" role="alert">{error}</p>}
+              <button className="button button-primary" type="submit">
+                {customerForm.id ? "Save customer" : "Add customer"} <Icon name="check" />
+              </button>
+            </form>
+            <CustomerTable
+              customers={customers.filter((customer) => `${customer.name} ${customer.phone} ${customer.address}`.toLowerCase().includes(customerQuery.toLowerCase()))}
+              onEdit={(customer) => setCustomerForm({ ...customer })}
+              onDelete={async (id) => {
+                const nextCustomers = customers.filter((customer) => customer.id !== id)
+                if (await saveCustomers(nextCustomers)) setFeedback("Customer record removed.")
+              }}
+            />
+          </section>
+        )}
+
+        {tab === "settings" && (
+          <section className="admin-panel settings-panel">
+            <span className="eyebrow">THE DETAILS THAT MATTER</span>
+            <h2>Keep the conversation going.</h2>
+            <p>This contact information is used for online order requests and customer communication.</p>
+            <form
+              className="form-stack"
+              onSubmit={async (e) => {
+                e.preventDefault()
+                const data = new FormData(e.currentTarget)
+                const next = {
+                  phone: String(data.get("whatsapp") ?? "").trim(),
+                  email: String(data.get("email") ?? "").trim(),
+                  address: String(data.get("address") ?? "").trim(),
+                  hours: String(data.get("hours") ?? "").trim(),
+                }
+                if (!/^\d{10,15}$/.test(next.phone.replace(/\D/g, ""))) {
+                  setError("Please enter a valid WhatsApp number in international digits.")
+                  return
+                }
+                if (await saveContactInfo(next)) {
+                  setError("")
+                  setFeedback("Contact details saved successfully.")
+                }
+              }}
+            >
+              <label>
+                WhatsApp number
+                <input name="whatsapp" type="tel" defaultValue={contactInfo.phone} required maxLength={24} />
+              </label>
+              <label>
+                Email address
+                <input name="email" type="email" defaultValue={contactInfo.email} required />
+              </label>
+              <label>
+                Cafe address
+                <input name="address" defaultValue={contactInfo.address} required maxLength={200} />
+              </label>
+              <label>
+                Opening hours
+                <input name="hours" defaultValue={contactInfo.hours} required maxLength={100} />
+              </label>
+              {error && <p className="form-error" role="alert">{error}</p>}
+              <button className="button button-primary" type="submit">
+                Save cafe settings <Icon name="check" />
+              </button>
+            </form>
+          </section>
+        )}
+        <footer className="admin-footer">
+          Lalazar Cafe · A little care makes all the difference.
+        </footer>
+      </main>
+      {edit && (
+        <Dialog title={isNewDish ? "Add a new dish" : `Edit ${edit.name}`} close={closeEdit}>
+          <form
+            className="form-stack"
+            onSubmit={async (e) => {
+              e.preventDefault()
+              const data = new FormData(e.currentTarget)
+              const price = Number(data.get("price"))
+              const name = String(data.get("name")).trim()
+              const urdu = String(data.get("urdu")).trim()
+              const description = String(data.get("description")).trim()
+              const category = String(data.get("category") || "Sajji & BBQ").trim()
+              if (!name || !description || !Number.isFinite(price) || price <= 0) {
+                setError("Enter a dish name, description and a valid positive price.")
+                return
+              }
+              const nextItem: MenuItem = {
+                id: Number(data.get("id") || edit.id) || Date.now(),
+                name,
+                urdu: urdu || name,
+                description,
+                price,
+                category,
+                image: String(data.get("image") || "/images/meal.jpg"),
+                available: data.get("available") !== "false",
+              }
+              const nextMenu = isNewDish ? [...menu, nextItem] : menu.map((item) => (item.id === edit.id ? nextItem : item))
+              if (await saveMenu(nextMenu)) {
+                setEdit(null)
+                setIsNewDish(false)
+                setFeedback(isNewDish ? "Dish added to the menu." : "Dish updated. Your website menu is up to date.")
+                setError("")
+              }
+            }}
+          >
+            <input type="hidden" name="id" value={edit.id} />
+            <label>
+              Dish name
+              <input name="name" defaultValue={edit.name} required maxLength={100} />
+            </label>
+            <label>
+              Urdu name
+              <input name="urdu" defaultValue={edit.urdu} maxLength={100} />
+            </label>
+            <label>
+              Category
+              <select name="category" defaultValue={edit.category || "Sajji & BBQ"}>
+                {CATEGORIES.filter((entry) => entry !== "All").map((entry) => (
+                  <option key={entry} value={entry}>
+                    {entry}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Price (PKR)
+              <input name="price" type="number" min="1" step="1" defaultValue={edit.price} required max="1000000" />
+            </label>
+            <label>
+              Image URL
+              <input name="image" defaultValue={edit.image || "/images/meal.jpg"} />
+            </label>
+            <label>
+              Description
+              <textarea name="description" defaultValue={edit.description} required rows={3} maxLength={500} />
+            </label>
+            <label>
+              Available
+              <select name="available" defaultValue={String(edit.available !== false)}>
+                <option value="true">Yes</option>
+                <option value="false">No</option>
+              </select>
+            </label>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <button className="button button-primary" type="submit">
+              {isNewDish ? "Add dish" : "Save dish"} <Icon name="check" />
+            </button>
+          </form>
+        </Dialog>
+      )}
+    </div>
+  )
+}
+
+function RevenueChart({ orders }: { orders: CustomerOrderRecord[] }) {
+  const [period, setPeriod] = useState<RevenuePeriod>("week")
+  const buckets = getRevenueBuckets(orders, period)
+  const total = buckets.reduce((sum, bucket) => sum + bucket.amount, 0)
+  const maxAmount = Math.max(...buckets.map((bucket) => bucket.amount), 0)
+  const periodLabels: Record<RevenuePeriod, string> = {
+    day: "Today",
+    week: "This week",
+    month: "This month",
+  }
+
+  return (
+    <section className="admin-panel revenue-panel">
+      <div className="panel-title">
+        <div>
+          <span className="eyebrow">ORDER PERFORMANCE</span>
+          <h2>Revenue</h2>
+          <p>
+            {periodLabels[period]} · {MONEY(total)} from eligible orders
+          </p>
+        </div>
+        <div className="revenue-periods" role="group" aria-label="Revenue period">
+          {(["day", "week", "month"] as const).map((value) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={period === value}
+              className={period === value ? "selected" : ""}
+              onClick={() => setPeriod(value)}
+            >
+              {periodLabels[value]}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div
+        className={`revenue-chart revenue-chart-${period}`}
+        role="img"
+        aria-label={`${periodLabels[period]} revenue chart totaling ${MONEY(total)}`}
+      >
+        {buckets.map((bucket, index) => (
+          <div className="revenue-column" key={bucket.key}>
+            <span className="revenue-value">{bucket.amount ? MONEY(bucket.amount) : ""}</span>
+            <div className="revenue-bar-track">
+              <div
+                className="revenue-bar"
+                style={{
+                  height: maxAmount
+                    ? `${Math.max(3, (bucket.amount / maxAmount) * 100)}%`
+                    : "0%",
+                }}
+                title={`${bucket.label}: ${MONEY(bucket.amount)}`}
+              />
+            </div>
+            {(period === "week" ||
+              (period === "day" && index % 3 === 0) ||
+              (period === "month" &&
+                (index % 5 === 0 || index === buckets.length - 1))) && (
+              <span className="revenue-label">{bucket.label}</span>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function Stat({
+  label,
+  value,
+  icon,
+}: {
+  label: string
+  value: string
+  icon: IconName
+}) {
+  return (
+    <div className="stat">
+      <div>
+        <span>{label}</span>
+        <strong>{value}</strong>
+      </div>
+      <Icon name={icon} />
+    </div>
+  )
+}
+
+function OrderTable({
+  orders,
+  onStatusChange,
+}: {
+  orders: CustomerOrderRecord[]
+  onStatusChange: (id: string, status: OrderStatus) => void
+}) {
+  if (!orders.length)
+    return (
+      <div className="empty-state request-empty">
+        <Icon name="bag" />
+        <h3>No orders yet.</h3>
+        <p>Customer orders will appear here as soon as they are placed.</p>
+      </div>
+    )
+
+  return (
+    <div className="table-scroll">
+      <table className="admin-table">
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Customer</th>
+            <th>Items</th>
+            <th>Deadline</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {orders.map((order) => (
+            <tr key={order.id}>
+              <td>
+                <div className="order-meta">
+                  <strong>{order.id}</strong>
+                  <small>{new Date(order.createdAt).toLocaleString()}</small>
+                </div>
+              </td>
+              <td>
+                <div className="order-meta">
+                  <strong>{order.customerName}</strong>
+                  <small>{order.customerPhone}</small>
+                  <small>{order.customerAddress}</small>
+                </div>
+              </td>
+              <td>
+                <div className="order-item-stack">
+                  {order.items.map((item) => (
+                    <span key={`${order.id}-${item.id}`}>
+                      {item.name} × {item.qty}
+                    </span>
+                  ))}
+                  <strong>Total {MONEY(order.subtotal)}</strong>
+                </div>
+              </td>
+              <td>
+                <div className="deadline-box">
+                  <strong>{getOrderDeadlineText(order)}</strong>
+                  <small>
+                    {new Date(
+                      new Date(order.createdAt).getTime() + order.deadlineMinutes * 60 * 1000,
+                    ).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                  </small>
+                </div>
+              </td>
+              <td>
+                <div className="status-stack">
+                  <select value={order.status} onChange={(e) => onStatusChange(order.id, e.target.value as OrderStatus)}>
+                    {ORDER_STATUS_FLOW.map((status) => (
+                      <option key={status} value={status}>
+                        {status}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="timeline">
+                    {order.timeline.map((entry) => {
+                      const done = ORDER_STATUS_FLOW.indexOf(entry.status) <= ORDER_STATUS_FLOW.indexOf(order.status)
+                      return (
+                        <div key={`${order.id}-${entry.status}`} className={`timeline-step ${done ? "done" : ""}`}>
+                          <span />
+                          <div>
+                            <strong>{entry.status}</strong>
+                            <small>{new Date(entry.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</small>
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function CustomerTable({
+  customers,
+  onEdit,
+  onDelete,
+}: {
+  customers: CustomerRecord[]
+  onEdit: (customer: CustomerRecord) => void
+  onDelete: (id: string) => void
+}) {
+  if (!customers.length)
+    return (
+      <div className="empty-state request-empty">
+        <Icon name="check" />
+        <h3>No customer records.</h3>
+        <p>Add a customer profile to keep contact and order details organized.</p>
+      </div>
+    )
+
+  return (
+    <div className="table-scroll customer-table">
+      <table className="admin-table">
+        <thead>
+          <tr>
+            <th>Customer</th>
+            <th>Phone</th>
+            <th>Address</th>
+            <th>Notes</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {customers.map((customer) => (
+            <tr key={customer.id}>
+              <td>
+                <div className="order-meta">
+                  <strong>{customer.name}</strong>
+                  <small>{customer.email || "No email"}</small>
+                </div>
+              </td>
+              <td>{customer.phone}</td>
+              <td>{customer.address}</td>
+              <td>{customer.notes || "—"}</td>
+              <td>
+                <div className="table-actions">
+                  <button className="icon-button" aria-label={`Edit ${customer.name}`} onClick={() => onEdit(customer)}>
+                    <Icon name="edit" />
+                  </button>
+                  <button className="icon-button danger" aria-label={`Delete ${customer.name}`} onClick={() => onDelete(customer.id)}>
+                    <Icon name="close" />
+                  </button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
